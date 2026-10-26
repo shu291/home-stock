@@ -1,0 +1,28 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isMember(hid) {
+      return request.auth != null &&
+        request.auth.uid in get(/databases/$(database)/documents/households/$(hid)).data.members;
+    }
+
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    match /households/{hid} {
+      allow create: if request.auth != null && request.resource.data.members == [request.auth.uid];
+      allow read: if request.auth != null && request.auth.uid in resource.data.members;
+      // 家族コード(=hid)を知っている人が自分だけを追加して参加できる
+      allow update: if request.auth != null && (
+        request.auth.uid in resource.data.members ||
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members']) &&
+         request.resource.data.members.toSet().difference(resource.data.members.toSet()) == [request.auth.uid].toSet())
+      );
+
+      match /items/{id} {
+        allow read, write: if isMember(hid);
+      }
+    }
+  }
+}
