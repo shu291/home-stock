@@ -28,3 +28,6 @@ dialog::backdrop{background:#0006}
 .empty{text-align:center;color:var(--mut);padding:40px 0}
 .fab{position:fixed;right:16px;bottom:calc(76px + env(safe-area-inset-bottom));width:56px;height:56px;border-radius:50%;font-size:28px;box-shadow:0 2px 8px #0004}
 .code{font:700 24px ui-monospace,monospace;letter-spacing:.1em;text-align:center;padding:8px;user-select:all}
+.rv .row{margin-bottom:4px}.rv2{display:grid;grid-template-columns:1fr 64px 92px;gap:6px}
+.rc .chk{font-size:13px;align-self:center;color:var(--mut)}.chk.ok{color:var(--acc);font-weight:700}.chk.ng{color:var(--warn);font-weight:700}
+.filebtn{display:flex;align-items:center;justify-content:center;cursor:pointer;text-align:center}
