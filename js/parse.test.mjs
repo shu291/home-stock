@@ -250,5 +250,67 @@ t('parseOrderMail は従来どおり', () => {
   assert.equal(r.length, 1); assert.equal(r[0].qty, 3); assert.equal(r[0].price, 1200);
 });
 
+// ---- 8. 実画像のOCRで見つかった崩れ方(匿名化した再現。店名・金額は架空) ----
+t('OCR崩れ: 年が%に化ける・千の位が読めない・区切りにカンマ・取引IDの日付', () => {
+  assert.equal(findDate('2026% 8 月 5 日 ( 水 ) 10:38'), '2026-08-05');
+  assert.equal(findDate('<026 年 09 月 22 日 ( 火 ) 19:22'), '2026-09-22');
+  assert.equal(findDate('2026,/08/27(A)19:51'), '2026-08-27');
+  assert.equal(findDate('2026% 96 月 18 日\n取引 ID 2145520260618115622'), '2026-06-18'); // 月が読めなければ取引IDの YYYYMMDD
+  assert.equal(findDate('電話 055-222-0031'), '');
+});
+const OCR_TAX = `ストア テスト 東店
+2026 年 09 月 22 日 ( 火 ) 19:22
+ダーススペシャル
+        @340x 3     *1,020
+メロン パン    *209
+アメリカンドッグ    *139
+( 商品 代金       ¥1,368)
+小 計 ( 税 抜 8%)   ¥1,368
+消費 税 等 ( 8%)    ¥109
+= B                 ¥1. 477
+PayPay 支 払       ¥1, 477`;
+t('OCR崩れ: 「合計」が化けても、小計+外税と一致する行を合計とする', () => {
+  const m = parseReceiptMeta(OCR_TAX), it = parseReceipt(OCR_TAX);
+  assert.equal(m.total, 1477);
+  assert.deepEqual(brief(it), ['ダーススペシャル|3|1020', 'メロン パン|1|209', 'アメリカンドッグ|1|139']);
+  assert.equal(checkTotal(it, m).ok, true);
+});
+t('OCR崩れ: 合計行が読めなくても、支払行から合計を推定', () => {
+  const x = 'ストア\nおにぎり 鮭   ¥150\nお茶   ¥140\nクレジット   ¥290\n';
+  assert.equal(parseReceiptMeta(x).total, 290);
+  const cash = 'ストア\nパン  ¥200\n牛乳  ¥180\n現金  ¥1,000\nお釣り  ¥620\n';
+  assert.equal(parseReceiptMeta(cash).total, 380);
+});
+t('OCR崩れ: 軽減税率マークが数字・記号に化けた金額を、小計との一致で直す', () => {
+  const x = `八百屋 テスト
+2026年9月26日
+えのき
+  2個 X 単88    \\176 軽
+おくら          ¥]0982
+ミニ トマト     ¥198 電
+計              ¥],579
+8% 対象         ¥1,579
+(うち 消費税   ¥126)`;
+  const it = parseReceipt(x);
+  assert.deepEqual(brief(it), ['えのき|2|176', 'おくら|1|109', 'ミニ トマト|1|198']);
+});
+t('OCR崩れ: 品目ではない行(決済・テーブル番号・住所・電話の断片・税率行)は拾わない', () => {
+  const x = `ストア テスト
+テーブルNo. 85   人数 3
+埼玉県入間郡三芳町藤久保 3331
+TEL 04-258- 1888
+きゅうり (@315X2/%) ¥630%
+8% 対象 ¥630
+合計    ¥680
+コード決済   ¥680
+ご利用額     ¥680`;
+  assert.deepEqual(brief(parseReceipt(x)), ['きゅうり|2|630']);
+  assert.equal(parseReceiptMeta(x).total, 680);
+});
+t('OCR崩れ: 合計より後ろ(ポイント・広告)の行は品目にしない', () => {
+  const x = 'ストア\nパン  ¥200\n合計  ¥200\nポイント対象金額  ¥200\nお得な クーポン配信中 300\n';
+  assert.deepEqual(brief(parseReceipt(x)), ['パン|1|200']);
+});
+
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
