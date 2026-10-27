@@ -21,6 +21,13 @@
    OAuth同意画面は「テスト」のまま、テストユーザーに家族のGmailを追加すれば審査不要
 6. GitHub Pages(Settings → Pages → main / root)で公開 → iPhone は Safari で開いて「ホーム画面に追加」
 
+## 商品名の検索を強化する(任意・楽天)
+バーコードの商品名は、標準では Open Food Facts(食品中心)で検索します。日用品も出したい場合:
+1. https://webservice.rakuten.co.jp/ でアプリを登録し、`applicationId` と `accessKey` を取得
+2. アプリの「WebサイトURL」に公開URL(`https://<ユーザー名>.github.io/`)を登録(未登録だと403になります)
+3. `js/config.js` の `rakutenApi` に貼る
+※ Yahoo!ショッピングAPIはブラウザからの呼び出し(CORS)を許可していないため、サーバー経由が必要で未対応です。
+
 ## 注意
 
 - Amazon に公式APIは無いため、注文確認メールの本文を解析しています。メール書式が変わると拾えないことがあるので、確認画面で直してください(解析は `js/parse.js` の `parseOrderMail`)

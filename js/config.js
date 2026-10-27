@@ -8,3 +8,6 @@ export const firebaseConfig = {
 
 // Gmail連携用 Google OAuth クライアントID(ウェブアプリ用)。空ならGmail取り込みは非表示。
 export const googleClientId = "";
+
+// 楽天ウェブサービス(商品名の検索用・任意)。空なら Open Food Facts だけで検索する。
+export const rakutenApi = { applicationId: "", accessKey: "" };

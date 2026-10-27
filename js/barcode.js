@@ -1,3 +1,4 @@
+import { rakutenApi } from './config.js';
 // バーコード読み取り。BarcodeDetector(Android/Chrome)があれば使い、なければ ZXing(iPhone Safari など)
 const FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e'];
 let zxingP;
@@ -47,8 +48,27 @@ export function scan(d) {
   });
 }
 
-// 商品名の検索(Open Food Facts。食品中心で、無い商品は手入力)
+// 商品名の検索。楽天(設定時・日用品に強い)→ Open Food Facts(食品)の順に試す。見つからなければ空
 export async function lookupName(code) {
+  return (await rakuten(code)) || (await openFoodFacts(code));
+}
+
+// 楽天の商品名は宣伝文句が長いので、【…】などを除いて短くする
+const tidy = (n) => n.replace(/【[^】]*】|［[^］]*］|\[[^\]]*\]|★[^★]*★|[☆★♪]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+
+async function rakuten(code) {
+  const { applicationId, accessKey } = rakutenApi;
+  if (!applicationId || !accessKey) return '';
+  try {
+    const u = `https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20220601?applicationId=${applicationId}&accessKey=${accessKey}&format=json&hits=1&keyword=${code}`;
+    const r = await fetch(u, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return '';
+    const it = (await r.json()).Items?.[0];
+    return tidy(it?.Item?.itemName ?? it?.itemName ?? '');
+  } catch { return ''; }
+}
+
+async function openFoodFacts(code) {
   try {
     const r = await fetch(`https://world.openfoodfacts.org/api/v2/product/${code}.json?fields=product_name,product_name_ja,brands`, { signal: AbortSignal.timeout(5000) });
     const p = (await r.json()).product; if (!p) return '';
