@@ -128,7 +128,17 @@ export function scan(d) {
 
 // 商品名の検索。楽天(設定時・日用品に強い)→ Open Food Facts(食品)の順に試す。見つからなければ空
 export async function lookupName(code) {
-  return (await rakuten(code)) || (await openFoodFacts(code));
+  return (await openBD(code)) || (await rakuten(code)) || (await openFoodFacts(code));
+}
+
+// 本(ISBN: 978/979 で始まる)は openBD で書名を取る。キー不要・無料
+async function openBD(code) {
+  if (!/^97[89]\d{10}$/.test(code)) return '';
+  try {
+    const r = await fetch(`https://api.openbd.jp/v1/get?isbn=${code}`, { signal: AbortSignal.timeout(5000) });
+    const m = (await r.json())?.[0]?.summary; if (!m?.title) return '';
+    return [m.title, m.volume].filter(Boolean).join(' ').slice(0, 60);
+  } catch { return ''; }
 }
 
 // 楽天の商品名は宣伝文句が長いので、【…】などを除いて短くする

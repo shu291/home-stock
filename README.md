@@ -29,7 +29,7 @@
 6. GitHub Pages(Settings → Pages → main / root)で公開 → iPhone は Safari で開いて「ホーム画面に追加」
 
 ## 商品名の検索を強化する(任意・楽天)
-バーコードの商品名は、標準では Open Food Facts(食品中心)で検索します。日用品も出したい場合:
+バーコードの商品名は、本(ISBN)は openBD(無料・キー不要)、食品は Open Food Facts で検索します(日本の日用品は見つからないことが多い)。日用品も出したい場合:
 1. https://webservice.rakuten.co.jp/ でアプリを登録し、`applicationId` と `accessKey` を取得
 2. アプリの「WebサイトURL」に公開URL(`https://<ユーザー名>.github.io/`)を登録(未登録だと403になります)
 3. `js/config.js` の `rakutenApi` に貼る
