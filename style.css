@@ -31,3 +31,8 @@ dialog::backdrop{background:#0006}
 .rv .row{margin-bottom:4px}.rv2{display:grid;grid-template-columns:1fr 64px 92px;gap:6px}
 .rc .chk{font-size:13px;align-self:center;color:var(--mut)}.chk.ok{color:var(--acc);font-weight:700}.chk.ng{color:var(--warn);font-weight:700}
 .filebtn{display:flex;align-items:center;justify-content:center;cursor:pointer;text-align:center}
+.eta{color:var(--mut)}.warn{color:var(--warn);font-weight:600}
+nav button{position:relative}.bd{position:absolute;top:6px;margin-left:2px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:var(--warn);color:#fff;font-size:11px;line-height:16px}
+.sec{font-size:15px;margin:16px 0 0}
+.sg .sgb{margin:4px 0 8px;line-height:1.6}.sg.alert{border-color:var(--warn)}
+.auto{font-size:10px;color:var(--acc);border:1px solid var(--acc);border-radius:4px;padding:0 3px;margin-left:4px}
