@@ -270,33 +270,31 @@ function renderFamily(v) {
   v.innerHTML = `<h2 class="vh">家族と設定</h2><div class="card"><h3>${esc(h.name)}</h3>${cloud ? `<p class="sub">家族に下のリンクを送ってください。開いてログインすると、参加の画面にコードが自動で入ります。</p><div class="code" id="code">${esc(h.id)}</div>
     <div class="row" style="flex-wrap:wrap"><button class="b p" id="sh" style="flex:1 1 45%;white-space:normal">家族にリンクを送る</button><button class="b" id="cl" style="flex:1 1 45%;white-space:normal">リンクをコピー</button><button class="b" id="cp" style="flex:1 1 45%;white-space:normal">コードだけコピー</button></div>` : `<p class="sub">いまは、この携帯だけで使っています(家族とは共有されません)。家族で共有するには js/config.js に Firebase の設定が必要です(README参照)。</p>`}</div>
   <div class="card"><h3>データの書き出し</h3><p class="sub">いまの在庫(${items.length}件)を、表計算ソフトなどで開けるファイルに保存します。</p><div class="row"><button class="b grow" id="ex-csv">CSV</button><button class="b grow" id="ex-json">JSON</button></div></div>
+  <div class="card"><h3>レシートの修正の学習</h3><p class="sub">レシートの読み間違いを直すと、この端末が覚えて、次から自動で直します(この端末の中だけに保存されます)。覚えた数: <span id="fxn">${fixLoad().length}</span>件</p><button class="b" id="fx-reset" ${fixLoad().length ? '' : 'disabled'}>修正の学習をリセット</button></div>
   ${cloud ? '<div class="danger"><button class="b" id="out">ログアウト</button></div>' : ''}`;
   const copy = (t, m) => (navigator.clipboard?.writeText(t) ?? Promise.reject()).then(() => toast(m), () => toast('コピーできませんでした。コードを長押しして選んでください'));
   $('#out')?.addEventListener('click', () => store.signOut());
   $('#cp')?.addEventListener('click', () => copy(h.id, 'コードをコピーしました'));
   $('#cl')?.addEventListener('click', () => copy(link, 'リンクをコピーしました'));
   $('#sh')?.addEventListener('click', () => (navigator.share ? navigator.share({ title: 'うちの在庫', text: `「うちの在庫」に参加してください。開いてログインすると家族コード(${h.id})が入ります。`, url: link }).catch(() => {}) : copy(link, 'リンクをコピーしました。LINEなどに貼ってください')));
+  $('#fx-reset').onclick = () => { const was = fixLoad(); fixSave([]); $('#fxn').textContent = '0'; $('#fx-reset').disabled = true; toast('修正の学習をリセットしました', () => { fixSave(was); renderFamily(v); }); };
   $('#ex-csv').onclick = () => exportData('csv'); $('#ex-json').onclick = () => exportData('json');
 }
 
 function renderImport(v) {
   v.innerHTML = `<h2>まとめて追加</h2><div class="card"><h3>バーコードで追加</h3><p class="sub">商品のバーコードをカメラで読むだけで追加できます。一度登録した商品は、次から数量が増えます。家族にも共有されます。</p><button class="b p" id="bc">バーコードを読む</button></div>
-  <div class="card"><h3>レシートを撮って追加</h3><p class="sub">端末の中で文字を読み取ります(画像は送信されません)。結果は確認してから登録します。</p><label class="b p filebtn">写真をえらぶ<input type="file" id="rc" accept="image/*" multiple class="vh"></label><div class="sub" id="rcs" role="status"></div></div>
+  <div class="card"><h3>レシートを撮って追加</h3><p class="sub">端末の中で文字を読み取ります(画像は送信されません)。読み間違いは、写真を見ながら直してから登録します。</p>
+  <ul class="tips"><li>明るい場所で撮る</li><li>レシートを平らにして、真上から撮る</li><li>自分の影が入らないようにする</li></ul>
+  <div class="row"><label class="b p filebtn grow">カメラで撮る<input type="file" id="rcc" accept="image/*" capture="environment" class="vh"></label><label class="b filebtn grow">アルバムから選ぶ<input type="file" id="rc" accept="image/*" multiple class="vh"></label></div><div id="rcs"></div></div>
   ${gmailAvailable ? `<div class="card"><h3>Gmailの注文メールから追加</h3><p class="sub">Amazon・楽天の注文確認メールを読み取ります(読み取り専用)。</p>
   <div class="grid2"><select id="gk" aria-label="お店"><option value="amazon">Amazon</option><option value="rakuten">楽天市場</option></select><select id="gm" aria-label="期間"><option value="1">過去1か月</option><option value="3" selected>過去3か月</option><option value="12">過去1年</option></select></div>
   <button class="b p" id="gb" style="margin-top:8px">読み取る</button><div class="sub" id="gs" role="status"></div></div>` : ''}
   <div class="card"><h3>注文メールの文章から追加</h3><p class="sub">注文履歴ページや購入メールの本文をそのまま貼り付けます。</p><textarea id="tx" rows="4" aria-label="貼り付ける文章"></textarea><button class="b" id="tb" style="margin-top:8px">読み取る</button></div>`;
   $('#bc').onclick = barcodeAdd;
-  $('#rc').onchange = async (e) => {
-    const fs = [...e.target.files]; if (!fs.length) return;
-    const s = $('#rcs'); resetReview();
-    try {
-      let raw = '';
-      for (const [i, f] of fs.entries()) raw += await readReceipt(f, (t) => (s.textContent = `${fs.length > 1 ? `${i + 1}/${fs.length}枚目 ` : ''}${t}`));
-      openReview(raw);
-    } catch (err) { s.textContent = err.message; }
-  };
+  const pick = (e) => { const fs = [...e.target.files]; e.target.value = ''; return startPhotos(fs, $('#rcs')); };
+  $('#rc').onchange = pick; $('#rcc').onchange = pick;
   $('#tb').onclick = () => { const t = $('#tx').value; import('./parse.js').then((m) => { const r = [...m.parseOrderMail(t, { source: 'paste', key: 'p' + Date.now() })]; if (r.length) startReview(r, t); else { resetReview(); addReceipt(parseReceipt(t).map((x) => ({ ...x, source: 'paste' })), parseReceiptMeta(t)); openReview(t); } }); };
+  if (reading && readBox?.id === 'rcs') $('#rcs').replaceWith(readBox);
   $('#gb')?.addEventListener('click', async () => {
     const s = $('#gs');
     try { startReview(await fetchOrders($('#gk').value, $('#gm').value, (a, b) => (s.textContent = `読み取り中 ${a}/${b}`))); }
@@ -305,22 +303,113 @@ function renderImport(v) {
 }
 
 // ---------- 取り込み確認 ----------
-const resetReview = () => { draft = []; receipts = []; };
+let reviewGen = 0, reading = false, readCancel = null, readBox = null; // reviewGen: 確認が閉じられた/やり直された後の遅れた結果を捨てるための世代
+let ph = { open: null, sel: 0, zoom: 220 }; // 写真パネル(open: null=自動 / zoom: 写真の表示幅 %)
+const READ_LIMIT = 60e3, SLOW_MS = 10e3;
+const FAIL_NOTE = 'うまく読み取れませんでした。写真を見ながら入力できます';
+// 写真は端末内のメモリ(ObjectURL)だけで持つ。保存も送信もしない。確認を閉じる/やり直すときに必ず手放す
+const resetReview = () => { receipts.forEach((r) => r.photo && URL.revokeObjectURL(r.photo)); draft = []; receipts = []; ph = { open: null, sel: 0, zoom: 220 }; reviewGen++; };
 
-// 写真1枚 → OCR → 確認中のリストに追加。戻り値は OCR テキスト
-async function readReceipt(file, onStatus) {
-  onStatus('読み取り中…(初回は言語データのダウンロードで時間がかかります)');
-  const t = await ocr(file, (p) => onStatus(`読み取り中 ${Math.round(p * 100)}%`));
-  addReceipt(parseReceipt(t), parseReceiptMeta(t));
-  onStatus('');
-  return t + '\n';
+// 「崩れた名前 → 直した名前」の学習(端末内の localStorage だけ。新しい順に最大 FMAX 件)
+const FKEY = 'hs-fixmap', FMAX = 300;
+const fixKey = (s) => String(s ?? '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+const fixLoad = () => { try { const a = JSON.parse(localStorage.getItem(FKEY)); return Array.isArray(a) ? a.filter((p) => Array.isArray(p) && p.length === 2 && p[0] && p[1]) : []; } catch { return []; } };
+const fixSave = (a) => { try { a.length ? localStorage.setItem(FKEY, JSON.stringify(a.slice(-FMAX))) : localStorage.removeItem(FKEY); } catch {} };
+const fixGet = (name) => { const k = fixKey(name); return k ? fixLoad().find((p) => p[0] === k)?.[1] : undefined; };
+const fixLearn = (pairs) => { if (!pairs.length) return; const ks = new Set(pairs.map((p) => p[0])); fixSave([...fixLoad().filter((p) => !ks.has(p[0])), ...pairs]); };
+
+// 品名が文字化けらしいか(理由を返す。空なら問題なし)。OCRの崩れ方(記号の混入・1文字・半角カナ・細切れ)を簡易に見る
+function suspectName(name) {
+  const s = String(name ?? '').trim(); if (!s) return '';
+  if ([...s].length <= 1) return '1文字だけです';
+  if (!/\p{L}/u.test(s)) return '数字や記号だけです';
+  if (/[ｦ-ﾟ]/.test(s)) return '半角カナが混ざっています';
+  if (/[|\\_=~^<>{}[\]@#$*;`¦¬°§¿。]/.test(s)) return '変な記号が混ざっています';
+  if (/[ぁ-ゖァ-ヺ][0-9０-９][ぁ-ゖァ-ヺ]/.test(s)) return '文字の間に数字が入っています';
+  if ((s.match(/[A-Za-z0-9]{4,}/g) || []).some((w) => /\d/.test(w) && /[A-Za-z]/.test(w) && !/^\d+[A-Za-z]{1,2}$/.test(w))) return '英数字が入り交じっています';
+  const t = s.split(/\s+/);
+  if (t.length >= 2 && t.some((x) => [...x].length === 1 && !/[一-龠々]/.test(x))) return '1文字だけの部分があります';
+  if (t.length >= 4 && s.replace(/\s/g, '').length / t.length < 3) return '文字が細かく分かれています';
+  return '';
+}
+// 金額が極端か(0円・レシート合計より高い・桁が多すぎる)
+function suspectPrice(c, r) {
+  if (c.rid === undefined) return '';
+  if (!c.price) return c.discount ? '' : '0円になっています';
+  if (r?.total && c.price > r.total) return 'レシートの合計より高くなっています';
+  if (c.price >= 50000) return '桁が多すぎるかもしれません';
+  return '';
 }
 
-// レシート1枚ぶんの品目と店名・日付・合計を draft / receipts に足す
-function addReceipt(cands, meta) {
+// 写真1枚ぶんの確認枠と、読めなかったとき手入力を始めるための空の行
+const blankRow = (rid) => ({ name: '', qty: 1, price: 0, boughtAt: receipts[rid]?.date || '', source: rid === undefined ? 'manual' : 'receipt', category: '', on: true, rid, checked: true, pchecked: true });
+
+// 写真(複数可)を1枚ずつ読む。失敗・時間切れ・0件・「やめる」のどれでも、その写真は手入力用の枠として残す
+async function readPhotos(files, box) {
+  reading = true; readBox = box;
+  const gen = reviewGen; // 読み取り中に確認が閉じられたら、以降は何も足さない
+  let cancelled = false, cur = 0, pct = 0, t0 = Date.now(), wake;
+  const cancelP = new Promise((r) => (wake = r));
+  readCancel = () => { cancelled = true; wake(null); };
+  box.innerHTML = '<div class="rdg"><div><span class="rd-m"></span> <span class="rd-t" aria-hidden="true"></span></div><div class="rd-w sub" role="status"></div><button type="button" class="b d" data-cancel>やめる(写真を見ながら入力)</button></div>';
+  const m = box.querySelector('.rd-m'), tt = box.querySelector('.rd-t'), w = box.querySelector('.rd-w');
+  const put = (e, s) => { if (e.textContent !== s) e.textContent = s; };
+  const paint = () => {
+    const s = Math.floor((Date.now() - t0) / 1000);
+    put(m, `${files.length > 1 ? `${cur + 1}/${files.length}枚目 ` : ''}読み取り中…`); put(tt, `${pct}% ・ ${s}秒`);
+    put(w, Date.now() - t0 >= SLOW_MS ? 'しばらくかかります。待たずに「やめる」を押して、写真を見ながら入力することもできます' : pct === 0 ? '(初回は言語データの読み込みで時間がかかります)' : '');
+  };
+  box.querySelector('[data-cancel]').onclick = () => readCancel?.();
+  const timer = setInterval(paint, 500);
+  try {
+    for (const [i, f] of files.entries()) {
+      if (gen !== reviewGen) break;
+      const rid = addReceipt([], null, URL.createObjectURL(f));
+      let text = '';
+      if (!cancelled) {
+        cur = i; pct = 0; t0 = Date.now(); paint();
+        let to;
+        try {
+          const op = ocr(f, (p) => { if (cur === i) pct = Math.round(p * 100); });
+          op.catch(() => {});
+          text = (await Promise.race([op, cancelP, new Promise((_, rj) => (to = setTimeout(() => rj(new Error('timeout')), READ_LIMIT)))])) || '';
+        } catch { text = ''; } finally { clearTimeout(to); }
+      }
+      if (gen !== reviewGen) break;
+      let cands = [], meta = null;
+      try { if (text) { cands = parseReceipt(text); meta = parseReceiptMeta(text); } } catch { cands = []; }
+      const r = receipts[rid];
+      if (meta) Object.assign(r, { store: meta.store || '', date: meta.date || '', total: meta.total || 0, tax: meta.tax || 0, adjust: meta.adjust || 0 });
+      if (cands.length) fillRows(rid, cands);
+      else { r.note = FAIL_NOTE; draft.push(blankRow(rid)); }
+    }
+  } finally { clearInterval(timer); box.innerHTML = ''; reading = false; readCancel = null; readBox = null; }
+}
+
+// 写真を読んで確認画面を出す。inDlg=確認画面の「写真を追加」から(いまの内容に足す)
+async function startPhotos(files, box, inDlg) {
+  if (!files.length) return;
+  if (reading) return toast('いま読み取り中です。終わるまでお待ちください');
+  if (!inDlg) resetReview();
+  const gen = reviewGen;
+  try {
+    await readPhotos(files, box);
+    if (gen !== reviewGen) return; // 読み取り中に確認が閉じられた
+    for (const c of draft) autoDraft(c);
+    reviewDialog();
+  } catch (err) { box.textContent = `うまくいきませんでした: ${err.message}`; }
+}
+
+// レシート1枚ぶんの枠(店名・日付・合計・写真)を足し、品目があれば draft に入れる。戻り値は rid
+function addReceipt(cands, meta, photo) {
   const rid = receipts.length;
-  receipts.push({ store: meta?.store || '', date: meta?.date || '', total: meta?.total || 0, tax: meta?.tax || 0, adjust: meta?.adjust || 0 });
-  draft.push(...cands.map((c) => ({ ...c, rid, on: true })));
+  receipts.push({ store: meta?.store || '', date: meta?.date || '', total: meta?.total || 0, tax: meta?.tax || 0, adjust: meta?.adjust || 0, photo: photo || '' });
+  fillRows(rid, cands);
+  return rid;
+}
+// 読み取った品目を draft に足す。前に直した名前(hs-fixmap)と一致する崩れは、直した名前を入れる
+function fillRows(rid, cands) {
+  draft.push(...cands.map((c) => { const fx = fixGet(c.name); return { ...c, rid, on: true, ocrName: c.name, ...(fx ? { name: fx, fix: true } : {}) }; }));
 }
 
 // メール・貼り付けの候補から確認画面へ
@@ -339,7 +428,7 @@ const autoDraft = (c) => {
   if (cat) { c.category = cat; c.auto = true; }
 };
 
-// draft が出来上がっていれば確認画面を開く(レシートは readReceipt/addReceipt で作成済み)
+// draft が出来上がっていれば確認画面を開く(レシートは startPhotos/addReceipt で作成済み)
 function openReview(raw) {
   for (const c of draft) autoDraft(c);
   if (!draft.length) { toast('品目を見つけられませんでした'); if (raw) editDialog(null, raw); return; }
@@ -347,55 +436,176 @@ function openReview(raw) {
 }
 
 const yen = (n) => '¥' + Math.abs(n).toLocaleString('ja-JP');
-// レシートごとの検算結果の表示(品目の合計 と レシートの合計)
-function checkText(r, n) {
+// レシートごとの検算(品目の合計 と レシートの合計)。差額を大きく出し、読み落としなら「その他」で埋めるボタンを付ける
+function checkHtml(r, n) {
   const c = checkTotal(draft.filter((x) => x.rid === n), r);
-  if (c.ok === null) return { cls: '', t: `品目計 ${yen(c.sum)} ・ 合計が読み取れませんでした(右の欄に入れると検算します)` };
-  if (c.ok) return { cls: 'ok', t: `✓ 合計と一致(${yen(c.sum)})` };
-  return { cls: 'ng', t: `⚠ 合計と合いません 品目計 ${yen(c.sum)} / 差額 ${c.diff > 0 ? '+' : '−'}${yen(c.diff)}(${c.diff > 0 ? '品目が多い' : '読み落としの可能性'})` };
+  if (c.ok === null) return `<div class="ck">品目の合計は ${yen(c.sum)} です。写真の「合計」の金額を上の欄に入れると、読み違いがないか検算します。</div>`;
+  if (c.ok) return `<div class="ck ok">✓ 合計と一致しました(${yen(c.sum)})</div>`;
+  const more = c.diff > 0;
+  return `<div class="ck ng"><div class="gap">⚠ 差額 ${more ? '+' : '−'}${yen(c.diff)}</div><div>品目の合計 ${yen(c.sum)} ・ レシートの合計 ${yen(c.total)}</div>
+    <div>${more ? '品目の金額が多すぎます。金額の読み違いや、同じ品が二重になっていないか、写真で確かめてください。' : '読み落とした品目か、金額の読み違いがあるかもしれません。'}</div>
+    ${more ? '' : `<button type="button" class="b" data-gap="${n}">差額 ${yen(c.diff)} を「その他」として追加</button>`}</div>`;
+}
+
+// 写真の全画面表示。1本指でなぞる・2本指で拡大・ダブルタップ・ボタンで拡大縮小
+function openViewer(url) {
+  let v = $('#pv');
+  if (!v) { v = document.createElement('dialog'); v.id = 'pv'; v.setAttribute('aria-label', 'レシートの写真'); document.body.append(v); }
+  v.innerHTML = '<div class="pvs"><img alt="レシートの写真" draggable="false"></div><div class="pvh">指でなぞると動かせます。2本の指で拡大できます</div><div class="pvb"><button type="button" class="b" data-z="1">＋ 大きく</button><button type="button" class="b" data-z="-1">－ 小さく</button><button type="button" class="b" data-z="0">全体を見る</button><button type="button" class="b p" data-x autofocus>閉じる</button></div>';
+  const st = v.querySelector('.pvs'), im = st.firstChild, P = new Map();
+  let s = 1, x = 0, y = 0, tap = 0, moved = 0;
+  const W = () => st.clientWidth, H = () => st.clientHeight, IH = () => (im.naturalWidth ? im.naturalHeight / im.naturalWidth : 1) * W();
+  const minS = () => Math.min(1, H() / IH());
+  const apply = () => {
+    const w = W() * s, h = IH() * s;
+    x = w > W() ? Math.min(0, Math.max(W() - w, x)) : (W() - w) / 2; y = h > H() ? Math.min(0, Math.max(H() - h, y)) : (H() - h) / 2;
+    im.style.transform = `translate(${x}px,${y}px) scale(${s})`;
+  };
+  const zoomAt = (ns, cx, cy) => { ns = Math.min(8, Math.max(minS(), ns)); x = cx - (cx - x) * ns / s; y = cy - (cy - y) * ns / s; s = ns; apply(); };
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+  st.onpointerdown = (e) => { try { st.setPointerCapture(e.pointerId); } catch {} P.set(e.pointerId, [e.clientX, e.clientY]); moved = 0; };
+  st.onpointermove = (e) => {
+    const p = P.get(e.pointerId); if (!p) return;
+    const prev = [...P.values()]; P.set(e.pointerId, [e.clientX, e.clientY]); const cur = [...P.values()];
+    moved += Math.abs(e.clientX - p[0]) + Math.abs(e.clientY - p[1]);
+    if (cur.length === 1) { x += e.clientX - p[0]; y += e.clientY - p[1]; apply(); }
+    else if (cur.length === 2) {
+      const mp = [(prev[0][0] + prev[1][0]) / 2, (prev[0][1] + prev[1][1]) / 2], mc = [(cur[0][0] + cur[1][0]) / 2, (cur[0][1] + cur[1][1]) / 2];
+      zoomAt(s * dist(cur[0], cur[1]) / (dist(prev[0], prev[1]) || 1), mp[0], mp[1]); x += mc[0] - mp[0]; y += mc[1] - mp[1]; apply();
+    }
+  };
+  const up = (e) => {
+    if (!P.delete(e.pointerId) || P.size || moved > 10) return;
+    const n = Date.now(); if (n - tap < 350) { s > 1.01 ? ((s = 1), (x = y = 0), apply()) : zoomAt(2.5, e.clientX, e.clientY); tap = 0; } else tap = n;
+  };
+  st.onpointerup = up; st.onpointercancel = (e) => P.delete(e.pointerId);
+  st.onwheel = (e) => { e.preventDefault(); zoomAt(s * (e.deltaY < 0 ? 1.25 : 0.8), e.clientX, e.clientY); };
+  v.querySelectorAll('[data-z]').forEach((b) => (b.onclick = () => { const z = +b.dataset.z; z ? zoomAt(s * (z > 0 ? 1.5 : 1 / 1.5), W() / 2, H() / 2) : zoomAt(minS(), W() / 2, H() / 2); }));
+  v.querySelector('[data-x]').onclick = () => v.close();
+  im.onload = apply; im.src = url; apply();
+  v.showModal();
 }
 
 function reviewDialog() {
-  const d = $('#dlg'), st = d.scrollTop;
-  const row = (c, n) => `<div class="card rv"><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
+  const d = $('#dlg'), st = d.scrollTop, pvOld = d.querySelector('.phv'), pvPos = pvOld ? [pvOld.scrollLeft, pvOld.scrollTop] : null;
+  delete d.dataset.cf;
+  const known = new Set(items.map((i) => norm(i.name)));
+  const names = [...new Set(items.map((i) => i.name))].slice(0, 500);
+  const hasPh = receipts.some((r) => r.photo), multi = receipts.length > 1;
+  if (!receipts[ph.sel]?.photo) ph.sel = Math.max(0, receipts.findIndex((r) => r.photo));
+  // 強調: 品名(未確認の文字化けらしさ)と金額(極端)。登録しない行・空の行は見ない
+  const flagsOf = (c) => {
+    if (!c.on || !c.name.trim() || c.ocrName === undefined) return null; // 取り込みで読んだ行だけ見る(手入力・メールは対象外)
+    const nm = !c.checked && !c.fix && !known.has(norm(c.name)) ? suspectName(c.name) : '', pr = !c.pchecked ? suspectPrice(c, receipts[c.rid]) : '';
+    return nm || pr ? { nm, pr } : null;
+  };
+  if (ph.open === null) ph.open = hasPh && (receipts.some((r) => r.note) ? innerHeight >= 500 : innerHeight >= 700 && draft.some((c) => flagsOf(c))); // 低い画面では写真を最初はしまっておく(編集欄が狭くなるため)
+  const row = (c, n) => `<div class="card rv" data-row="${n}"><div class="fl" data-fl="${n}"></div><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" list="rv-names" autocomplete="off" autocorrect="off" enterkeyhint="next" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
     <div class="rv2"><div><label>カテゴリ</label><select data-ct="${n}"><option value="">未設定</option>${CATS.map((x) => `<option ${x === c.category ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
-    <div><label>数量</label><input data-q="${n}" type="number" inputmode="numeric" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" inputmode="numeric" min="0" value="${c.price || ''}"></div></div>
-    <div class="sub">${c.auto && c.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : ''}${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}</div></div>`;
-  const head = (r, n) => { const k = checkText(r, n); return `<div class="card rc"><div class="grid2"><div><label>店名</label><input data-rs="${n}" value="${esc(r.store)}"></div><div><label>日付</label><input type="date" data-rd="${n}" value="${esc(r.date)}"></div></div>
-    <div class="grid2"><div><label>レシートの合計(円)</label><input type="number" inputmode="numeric" min="0" data-rt="${n}" value="${r.total || ''}"></div><div class="chk ${k.cls}" data-ck="${n}" role="status">${k.t}</div></div></div>`; };
-  d.innerHTML = `<h3 id="dlg-h" tabindex="-1" autofocus>この内容で登録しますか?</h3><p class="sub">名前・数量・金額・カテゴリを直せます。同じ名前が在庫にあれば数量を足します。</p>
-  ${receipts.map(head).join('')}${draft.map(row).join('')}
-  <div class="row" style="margin-top:8px"><button class="b grow" id="ad">＋ 品目を追加</button>${receipts.length ? '<label class="b grow filebtn">別の写真を追加<input type="file" id="more" accept="image/*" multiple class="vh"></label>' : ''}</div>
-  <div class="sub" id="mst"></div>
-  <div class="stickybar"><button class="b" id="cx">やめる</button><button class="b p grow" id="ok">登録</button></div>`;
-  const cnt = () => { const n = draft.filter((x) => x.on && x.name.trim()).length; $('#ok').textContent = `${n}件を登録`; $('#ok').disabled = !n; };
-  const refresh = () => receipts.forEach((r, n) => { const k = checkText(r, n), e = d.querySelector(`[data-ck="${n}"]`); if (e) { e.className = `chk ${k.cls}`; e.textContent = k.t; } });
-  d.querySelectorAll('[data-on]').forEach((e) => (e.onchange = () => { draft[e.dataset.on].on = e.checked; cnt(); }));
-  d.querySelectorAll('[data-nm]').forEach((e) => (e.oninput = () => { draft[e.dataset.nm].name = e.value; cnt(); }));
+    <div><label>数量</label><input data-q="${n}" type="number" inputmode="numeric" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" inputmode="numeric" enterkeyhint="next" min="0" value="${c.price || ''}"></div></div>
+    <div class="sub">${c.fix ? `<span class="fixd" data-fx="${n}">前回の修正を適用</span> ・ ` : ''}${c.auto && c.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : ''}${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}${c.gap ? ' ・ 検算用(在庫には登録しません)' : ''}</div></div>`;
+  const smTxt = (r) => `店名・日付: ${r.store || '(なし)'} ・ ${r.date ? dateJa(r.date) : '(日付なし)'}(タップで直す)`;
+  const add = (rid) => `<button type="button" class="b" data-add="${rid ?? ''}" style="width:100%">＋ 品目を追加${multi ? `(${rid + 1}枚目)` : ''}</button>`;
+  const head = (r, n) => `<div class="card rc"><div class="rh">${r.photo ? `<button type="button" class="th" data-pv="${n}" aria-label="${multi ? `${n + 1}枚目の` : ''}レシートの写真を全画面で見る"><img src="${r.photo}" alt=""></button>` : ''}<div class="grow"><div class="rt">レシート${multi ? ` ${n + 1}枚目` : ''}</div>${r.note ? `<div class="note"><span aria-hidden="true">⚠ </span>${esc(r.note)}</div>` : ''}${r.photo ? '<div class="sub">写真をタップすると大きく見られます</div>' : ''}</div></div>
+    <details class="more"><summary data-sm="${n}">${esc(smTxt(r))}</summary><div class="grid2"><div><label>店名</label><input data-rs="${n}" value="${esc(r.store)}"></div><div><label>日付</label><input type="date" data-rd="${n}" value="${esc(r.date)}"></div></div></details>
+    <label>レシートの合計(円)</label><input type="number" inputmode="numeric" min="0" data-rt="${n}" value="${r.total || ''}" placeholder="写真の「合計」の金額">
+    <div data-ck="${n}" role="status">${checkHtml(r, n)}</div></div>
+    ${draft.map((c, i) => (c.rid === n ? row(c, i) : '')).join('')}${add(n)}`;
+  const phSel = receipts.map((r, n) => (r.photo && multi ? `<button type="button" class="b" data-phs="${n}" aria-pressed="${n === ph.sel}">${n + 1}枚目</button>` : '')).join('');
+  const manual = receipts.length && receipts.every((r) => r.note);
+  const keepBox = reading && readBox?.id === 'mst' && readBox;
+  d.innerHTML = `<div class="phbar" id="phbar"><div class="row">${hasPh ? `<button type="button" class="b grow" id="phtg" aria-expanded="${ph.open}" aria-controls="phpn">📷 写真を${ph.open ? 'しまう' : '見ながら直す'}</button>` : ''}<button type="button" class="b grow" id="jump" hidden></button></div>
+  ${hasPh ? `<div id="phpn" ${ph.open ? '' : 'hidden'}><div class="phw"><div class="phc">${phSel}<button type="button" class="b" data-zm="-1" aria-label="写真を小さくする">－</button><button type="button" class="b" data-zm="1" aria-label="写真を大きくする">＋</button><button type="button" class="b" id="phfs">全画面</button></div>
+  <div class="phv" tabindex="0" role="region" aria-label="レシートの写真(指でなぞると動かせます)"><img id="phimg" src="${receipts[ph.sel].photo}" alt="レシートの写真" style="width:${ph.zoom}%"></div></div></div>` : ''}</div>
+  <h3 id="dlg-h" tabindex="-1" autofocus>${manual ? '写真を見ながら入力してください' : 'この内容で登録しますか?'}</h3><p class="sub">${manual ? '名前と金額を入れてください。次の欄へは「次へ」キーで進めます。' : '黄色の行は読み間違いかもしれません。写真を見て、名前・数量・金額を直せます。'}同じ名前が在庫にあれば数量を足します。</p>
+  <datalist id="rv-names">${names.map((x) => `<option value="${esc(x)}">`).join('')}</datalist>
+  ${receipts.map(head).join('')}${draft.some((c) => c.rid === undefined) ? draft.map((c, i) => (c.rid === undefined ? row(c, i) : '')).join('') + add(undefined) : ''}
+  ${receipts.length ? `<div class="row" style="margin-top:8px"><label class="b grow filebtn">写真を撮って追加<input type="file" id="more-cam" accept="image/*" capture="environment" class="vh"></label><label class="b grow filebtn">アルバムから追加<input type="file" id="more" accept="image/*" multiple class="vh"></label></div>` : ''}
+  <div id="mst"></div>
+  <div class="stickybar"><div class="cf" id="cf" role="alert" hidden></div><button class="b" id="cx">やめる</button><button class="b p grow" id="ok">登録</button></div>`;
+  if (keepBox) $('#mst').replaceWith(keepBox); // 読み取り中の表示(やめるボタン)を作り直しで消さない
+  const nOn = () => draft.filter((x) => x.on && x.name.trim()).length;
+  const cnt = () => { const n = nOn(); $('#ok').textContent = `${d.dataset.cf ? 'このまま' : ''}${n}件を登録`; $('#ok').disabled = !n; };
+  const flagged = () => draft.map((c, i) => (flagsOf(c) ? i : -1)).filter((i) => i >= 0);
+  const jump = () => {
+    const fl = flagged(); if (!fl.length) return;
+    const n = fl.find((i) => i > jumpAt) ?? fl[0]; jumpAt = n;
+    const e = d.querySelector(`[data-nm="${n}"]`); e.closest('.rv').scrollIntoView({ block: 'start' }); e.focus({ preventScroll: true });
+    if (flagsOf(draft[n]).nm) e.select();
+  };
+  let jumpAt = -1;
+  const refreshFlags = () => {
+    let nn = 0, np = 0;
+    draft.forEach((c, i) => {
+      const card = d.querySelector(`[data-row="${i}"]`); if (!card) return;
+      const f = flagsOf(c), fl = card.querySelector('.fl');
+      card.classList.toggle('hl', !!f); card.querySelector('[data-nm]').classList.toggle('bad', !!f?.nm); card.querySelector('[data-pr]').classList.toggle('bad', !!f?.pr);
+      const html = f ? `${f.nm ? `<div><span aria-hidden="true">⚠ </span>写真を見て品名を直してください(${f.nm})</div>` : ''}${f.pr ? `<div><span aria-hidden="true">⚠ </span>金額を確かめてください(${f.pr})</div>` : ''}<button type="button" class="b" data-okrow="${i}">このままで合っている</button>` : '';
+      if (fl.innerHTML !== html) { fl.innerHTML = html; fl.querySelector('[data-okrow]')?.addEventListener('click', () => { c.checked = c.pchecked = true; refreshFlags(); cnt(); }); }
+      if (f?.nm) nn++; else if (f?.pr) np++;
+    });
+    const j = $('#jump'), n = nn + np;
+    j.hidden = !n; j.textContent = `⚠ 要確認 ${n}件`; j.setAttribute('aria-label', `要確認の行へ移動(あと${n}件)`);
+    const cf = $('#cf');
+    if (!n) { delete d.dataset.cf; cf.hidden = true; }
+    else if (d.dataset.cf) { cf.hidden = false; cf.innerHTML = `<span><span aria-hidden="true">⚠ </span>${nn ? `${nn + np}件の品名・金額が未確認です` : `${np}件の金額が未確認です`}。写真と見くらべましたか?</span><button type="button" class="b" id="cf-j">確認する</button>`; $('#cf-j').onclick = jump; }
+    $('#phbar').hidden = !hasPh && !n;
+  };
+  const refresh = (first) => { receipts.forEach((r, n) => {
+    const e = d.querySelector(`[data-ck="${n}"]`), h = checkHtml(r, n); d.querySelector(`[data-rt="${n}"]`).classList.toggle('bad', !r.total);
+    if (e && (first || e.innerHTML !== h)) { e.innerHTML = h; e.querySelector('[data-gap]')?.addEventListener('click', () => addGap(n)); }
+  }); refreshFlags(); };
+  const addGap = (n) => {
+    const r = receipts[n], c = checkTotal(draft.filter((x) => x.rid === n), r); if (c.ok !== false || c.diff >= 0) return;
+    draft.push({ ...blankRow(n), name: 'その他', price: -c.diff, category: 'その他', auto: false, gap: true, on: false });
+    reviewDialog(); toast('差額を「その他」として足しました(在庫には登録しません)');
+  };
+  const addRow = (rid) => { draft.push(blankRow(rid)); reviewDialog(); d.querySelector(`[data-nm="${draft.length - 1}"]`)?.focus(); };
+  d.querySelectorAll('[data-on]').forEach((e) => (e.onchange = () => { draft[e.dataset.on].on = e.checked; cnt(); refreshFlags(); }));
+  d.querySelectorAll('[data-nm]').forEach((e) => {
+    const n = +e.dataset.nm;
+    e.oninput = () => { const c = draft[n]; c.name = e.value; if (c.fix) { c.fix = false; d.querySelector(`[data-fx="${n}"]`)?.remove(); } cnt(); refreshFlags(); };
+    e.onchange = () => { draft[n].checked = true; refreshFlags(); }; // 手で直したら確認済み
+    e.onfocus = () => { if (!flagsOf(draft[n])?.nm) return; const v = e.value; e.select(); setTimeout(() => e.value === v && e.select(), 0); }; // 崩れた名前は全選択 → そのまま打てば置き換わる/候補が出る
+    e.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); const nx = flagged().find((i) => i > n); (nx === undefined ? d.querySelector(`[data-pr="${n}"]`) : d.querySelector(`[data-nm="${nx}"]`)).focus(); } }; // 次へ: 要確認の行が続くならそこへ(金額は合っていることが多い)
+  });
   d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { draft[e.dataset.ct].category = e.value; draft[e.dataset.ct].auto = false; e.closest('.rv').querySelector('.auto')?.remove(); }));
   d.querySelectorAll('[data-q]').forEach((e) => (e.oninput = () => (draft[e.dataset.q].qty = Math.max(1, +e.value || 1))));
-  d.querySelectorAll('[data-pr]').forEach((e) => (e.oninput = () => { draft[e.dataset.pr].price = Math.max(0, +e.value || 0); refresh(); }));
-  d.querySelectorAll('[data-rm]').forEach((e) => (e.onclick = () => { draft.splice(+e.dataset.rm, 1); reviewDialog(); }));
-  d.querySelectorAll('[data-rs]').forEach((e) => (e.oninput = () => (receipts[e.dataset.rs].store = e.value)));
-  d.querySelectorAll('[data-rd]').forEach((e) => (e.onchange = () => { receipts[e.dataset.rd].date = e.value; draft.forEach((c) => c.rid === +e.dataset.rd && (c.boughtAt = e.value)); }));
-  d.querySelectorAll('[data-rt]').forEach((e) => (e.oninput = () => { receipts[e.dataset.rt].total = Math.max(0, +e.value || 0); refresh(); }));
-  $('#ad').onclick = () => {
-    const rid = receipts.length ? receipts.length - 1 : undefined;
-    draft.push({ name: '', qty: 1, price: 0, boughtAt: receipts[rid]?.date || '', source: rid === undefined ? 'manual' : 'receipt', category: '', on: true, rid });
-    reviewDialog(); d.querySelector(`[data-nm="${draft.length - 1}"]`)?.focus();
-  };
-  $('#more')?.addEventListener('change', async (e) => {
-    const fs = [...e.target.files], s = $('#mst'); if (!fs.length) return;
-    try {
-      for (const [i, f] of fs.entries()) await readReceipt(f, (t) => (s.textContent = `${fs.length > 1 ? `${i + 1}/${fs.length}枚目 ` : ''}${t}`));
-      for (const c of draft) autoDraft(c);
-      reviewDialog();
-    } catch (err) { s.textContent = err.message; }
+  d.querySelectorAll('[data-pr]').forEach((e) => {
+    const n = +e.dataset.pr;
+    e.oninput = () => { draft[n].price = Math.max(0, +e.value || 0); refresh(); };
+    e.onchange = () => { draft[n].pchecked = true; refreshFlags(); };
+    e.onkeydown = (ev) => {
+      if (ev.key !== 'Enter') return; ev.preventDefault();
+      const all = [...d.querySelectorAll('[data-nm]')], nx = all[all.findIndex((x) => +x.dataset.nm === n) + 1];
+      nx ? nx.focus() : addRow(draft[n].rid);
+    };
   });
+  d.querySelectorAll('[data-rm]').forEach((e) => (e.onclick = () => { draft.splice(+e.dataset.rm, 1); reviewDialog(); }));
+  d.querySelectorAll('[data-rs]').forEach((e) => (e.oninput = () => { receipts[e.dataset.rs].store = e.value; d.querySelector(`[data-sm="${e.dataset.rs}"]`).textContent = smTxt(receipts[e.dataset.rs]); }));
+  d.querySelectorAll('[data-rd]').forEach((e) => (e.onchange = () => { receipts[e.dataset.rd].date = e.value; d.querySelector(`[data-sm="${e.dataset.rd}"]`).textContent = smTxt(receipts[e.dataset.rd]); draft.forEach((c) => c.rid === +e.dataset.rd && (c.boughtAt = e.value)); }));
+  d.querySelectorAll('[data-rt]').forEach((e) => (e.oninput = () => { receipts[e.dataset.rt].total = Math.max(0, +e.value || 0); refresh(); }));
+  d.querySelectorAll('[data-add]').forEach((e) => (e.onclick = () => addRow(e.dataset.add === '' ? undefined : +e.dataset.add)));
+  d.querySelectorAll('[data-pv]').forEach((e) => (e.onclick = () => { ph.sel = +e.dataset.pv; openViewer(receipts[ph.sel].photo); }));
+  // 写真パネル(上に固定): 開閉・枚数の切り替え・拡大縮小・全画面
+  const img = $('#phimg'), pv = d.querySelector('.phv');
+  if (img) {
+    const toggle = () => { ph.open = !ph.open; $('#phpn').hidden = !ph.open; const b = $('#phtg'); b.setAttribute('aria-expanded', ph.open); b.textContent = `📷 写真を${ph.open ? 'しまう' : '見ながら直す'}`; };
+    $('#phtg').onclick = toggle;
+    $('#phfs').onclick = () => openViewer(receipts[ph.sel].photo);
+    d.querySelectorAll('[data-phs]').forEach((e) => (e.onclick = () => { ph.sel = +e.dataset.phs; img.src = receipts[ph.sel].photo; pv.scrollTo(0, 0); d.querySelectorAll('[data-phs]').forEach((b) => b.setAttribute('aria-pressed', +b.dataset.phs === ph.sel)); }));
+    d.querySelectorAll('[data-zm]').forEach((e) => (e.onclick = () => { ph.zoom = Math.min(400, Math.max(100, ph.zoom + 60 * +e.dataset.zm)); img.style.width = `${ph.zoom}%`; }));
+    if (pvPos) { const put = () => pv.scrollTo(pvPos[0], pvPos[1]); img.complete ? put() : img.addEventListener('load', put, { once: true }); }
+  }
+  $('#jump').onclick = jump;
+  const more = async (e) => { const fs = [...e.target.files]; e.target.value = ''; await startPhotos(fs, $('#mst'), true); };
+  $('#more')?.addEventListener('change', more); $('#more-cam')?.addEventListener('change', more);
   $('#cx').onclick = () => d.close();
   $('#ok').onclick = () => {
+    if (flagged().length && !d.dataset.cf) { d.dataset.cf = '1'; refreshFlags(); cnt(); $('#cf-j').focus(); return; } // 強調が残っていれば一度だけ確認(止めはしない)
     const byName = new Map(items.map((i) => [norm(i.name), i]));
     let n = 0;
+    fixLearn(draft.filter((c) => c.on && c.name.trim() && c.ocrName && fixKey(c.ocrName) && fixKey(c.name) !== fixKey(c.ocrName) && !known.has(norm(c.ocrName))).map((c) => [fixKey(c.ocrName), c.name.trim()])); // 崩れ→直した名前を学習(端末内のみ)
     for (const c of draft.filter((x) => x.on && x.name.trim())) {
       const ex = byName.get(norm(c.name));
       const keys = c.srcKey ? [c.srcKey] : [];
@@ -407,9 +617,11 @@ function reviewDialog() {
     }
     d.close(); toast(`${n}件を登録しました`); tab = 'stock'; render();
   };
-  cnt();
+  refresh(true); cnt();
+  const sync = () => d.style.setProperty('--phh', `${$('#phbar').offsetHeight}px`);
   openDlg('review');
-  d.scrollTop = st;
+  d.scrollTop = st; sync();
+  if (img) { img.addEventListener('load', sync); }
 }
 
 // ---------- バーコード追加 ----------
@@ -527,6 +739,7 @@ dlg.addEventListener('click', (e) => {
   if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) dlg.close();
 });
 dlg.addEventListener('close', () => {
+  if (dlg.dataset.kind === 'review') { readCancel?.(); resetReview(); } // 写真(ObjectURL)をここで手放す
   const o = dlgOrigin; dlgOrigin = null; if (!o) return;
   (o.el.isConnected ? o.el : o.id && document.querySelector(`.item[data-id="${o.id}"] ${o.sel}`))?.focus?.({ preventScroll: true });
 });
