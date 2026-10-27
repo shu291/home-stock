@@ -1,6 +1,7 @@
 // 端末内だけで動く軽量な統計・ヒューリスティクス(外部AI・通信なし)。DOM/Firestore 非依存の純粋関数。
 // 推定なので、履歴が少ないうちは当たらない。使うほど正確になる。
-import { guessCategory } from './category.js';
+import { guessClass } from './category.js';
+import { canonCategory, canonLocation, fitLocation, SUB_LOC, CAT_LOC } from './taxonomy.js';
 
 const DAY = 86400000;
 
@@ -168,51 +169,48 @@ function findDuplicates(items, now) {
 }
 
 // ---- 自動分類 ----
-// 名前に当たったら置き場所を決める(カテゴリより細かい)
-const NAME_LOC = [
-  [/食器|キュキュット|ジョイ|スポンジ|たわし|ラップ|ホイル|キッチン|ふきん|布巾|ゴミ袋|ごみ袋|保存袋|割り?箸/, 'キッチン'],
-  [/トイレ(?!ット)|カビ取|バス用|お?風呂/, '風呂・トイレ'],
-  [/シャンプー|リンス|コンディショナー|トリートメント|ボディソープ|ハンドソープ|歯磨|歯ブラシ|洗顔|洗口|マウスウォッシュ|化粧水|乳液|洗濯|柔軟剤|漂白/, '洗面所'],
-];
-// カテゴリごとの既定の置き場所(確信度つき。日用品・薬・消耗品は家ごとに違うので既定なし=空のまま)
-const CAT_LOC = { 食品: ['キッチン', 0.7], 飲料: ['キッチン', 0.7], '洗剤・衛生': ['洗面所', 0.65] };
-
-// 品目の category / location が空のとき、埋める値を推定して返す(埋めない項目は '')。
-// 優先: 1 学習(手で付けた分類を持つ類似名の品目) 2 辞書(guessCategory) 3 置き場所の既定。確信度が低ければ空。
-// 戻り値 {category, location, conf:{category, location}, from:{category, location}}
-// opts.locs: 有効な置き場所の一覧(これ以外は返さない)
+// 品目の category / sub / location が空のとき、埋める値を推定して返す(埋めない項目は '')。ユーザーが選んだ値は返さない=上書きしない。
+// 優先: 1 学習(家族が手で付けた分類を持つ類似名の品目。auto:true は学習元にしない) 2 辞書(guessClass) 3 置き場所の既定(小分類→大分類)。
+// 確信度が低ければ空(誤分類より未分類)。
+// 戻り値 {category, sub, location, conf:{category, sub, location}, from:{category, sub, location}}  from は 'learned'|'dict'|'sub'(小分類の既定)|'category'(大分類の既定)
+// opts.locs: 有効な置き場所の一覧(これ以外は返さない。古い一覧なら「冷蔵庫→キッチン」のように代替名に読み替える)
 export function autoClassify(item, items = [], opts = {}) {
-  const res = { category: '', location: '', conf: { category: 0, location: 0 }, from: { category: '', location: '' } };
+  const res = { category: '', sub: '', location: '', conf: { category: 0, sub: 0, location: 0 }, from: { category: '', sub: '', location: '' } };
   const bk = base(key(item?.name));
   if (!bk) return res;
-  const needCat = !item.category, needLoc = !item.location;
-  const okLoc = (l) => l && (!opts.locs || opts.locs.includes(l));
+  const needCat = !item.category, needSub = !item.sub, needLoc = !item.location;
+  const g = guessClass(item.name);
+  const canonCat = (x) => canonCategory(x.category, guessClass(x.name).category);
   const teachers = (items || []).filter((x) => x !== item && x.id !== item.id && !x.auto && x.name)
     .map((x) => ({ x, s: dice(bk, base(key(x.name))) })).filter((t) => t.s >= LEARN_SIM);
-  const vote = (field, valid) => {
+  const vote = (pick) => {
     const m = new Map();
-    for (const { x, s } of teachers) if (valid(x[field])) { const v = m.get(x[field]) || { sum: 0, best: 0 }; v.sum += s; v.best = Math.max(v.best, s); m.set(x[field], v); }
+    for (const { x, s } of teachers) { const f = pick(x); if (f) { const v = m.get(f) || { sum: 0, best: 0 }; v.sum += s; v.best = Math.max(v.best, s); m.set(f, v); } }
     return [...m].sort((a, b) => b[1].sum - a[1].sum)[0];
   };
+  const set = (f, val, conf, from) => { if (conf >= MIN_CONF && val) { res[f] = val; res.conf[f] = conf; res.from[f] = from; } };
+  // 大分類(ユーザー指定があればそれを基準に小分類・置き場所を決める。古い版の名前は新体系へ読み替え)
   if (needCat) {
-    const v = vote('category', Boolean);
-    if (v) Object.assign(res, { category: v[0] }), (res.conf.category = v[1].best, res.from.category = 'learned');
-    else {
-      const g = guessCategory(item.name);
-      if (g) { res.category = g; res.conf.category = 0.7; res.from.category = 'dict'; }
-    }
-    if (res.conf.category < MIN_CONF) Object.assign(res, { category: '' }), (res.conf.category = 0, res.from.category = '');
+    const v = vote((x) => x.category && canonCat(x));
+    if (v) set('category', v[0], v[1].best, 'learned'); else set('category', g.category, g.conf, 'dict');
   }
+  const cat = item.category ? canonCategory(item.category, g.category) : res.category;
+  // 小分類(同じ大分類の教師から。無ければ辞書の小分類が同じ大分類のときだけ)
+  if (needSub && cat) {
+    const v = vote((x) => x.sub && canonCat(x) === cat && x.sub);
+    if (v) set('sub', v[0], v[1].best, 'learned'); else if (g.sub && canonCategory(g.category, '') === cat) set('sub', g.sub, g.conf, 'dict');
+  }
+  const sub = item.sub || res.sub;
+  // 置き場所(学習 → 小分類の既定 → 大分類の既定)
   if (needLoc) {
-    const v = vote('location', okLoc);
-    if (v) { res.location = v[0]; res.conf.location = v[1].best; res.from.location = 'learned'; }
+    const fit = (l, name) => fitLocation(canonLocation(l, name), opts.locs);
+    const v = vote((x) => x.location && fit(x.location, x.name));
+    if (v) set('location', v[0], v[1].best, 'learned');
     else {
-      const nm = NAME_LOC.find(([re]) => re.test(String(item.name).normalize('NFKC')));
-      const cat = item.category || res.category, cl = CAT_LOC[cat];
-      if (nm && okLoc(nm[1])) { res.location = nm[1]; res.conf.location = 0.8; res.from.location = 'name'; }
-      else if (cl && okLoc(cl[0])) { res.location = cl[0]; res.conf.location = cl[1]; res.from.location = 'category'; }
+      const d = SUB_LOC[cat]?.[sub] || null, c = CAT_LOC[cat] || null;
+      const pick = [[d, 'sub'], [c, 'category']].find(([e]) => e && e[1] >= MIN_CONF && fit(e[0], ''));
+      if (pick) set('location', fit(pick[0][0], ''), pick[0][1], pick[1]);
     }
-    if (res.conf.location < MIN_CONF) Object.assign(res, { location: '' }), (res.conf.location = 0, res.from.location = '');
   }
   return res;
 }
@@ -240,7 +238,7 @@ export function plan(items, now = Date.now(), opts = {}) {
     if (!i.category || !i.location) {
       const r = autoClassify(i, list, opts);
       if (!i.category) uncategorized.push({ item: i, guess: r.category });
-      if (r.category || r.location) autoFill.push({ item: i, ...r });
+      if (r.category || r.sub || r.location) autoFill.push({ item: i, ...r });
     }
     if (qty > 0) {
       const last = cleanLog(i.log, now).pop()?.t ?? (Number.isFinite(i.updatedAt) ? i.updatedAt : null);

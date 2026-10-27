@@ -212,7 +212,7 @@ t('mergeItems: 履歴を合流し、undefined を作らない', () => {
 // ---- 未分類 / overstock ----
 t('uncategorized: guessCategory の候補つき・分類済みは出ない', () => {
   const r = plan([it('牛乳', 1, [], { category: '', location: 'キッチン' }), it('謎の品', 1, [], { category: '' }), it('米', 1)], NOW).uncategorized;
-  assert.deepEqual(r.map((x) => [x.item.name, x.guess]), [['牛乳', '食品'], ['謎の品', '']]);
+  assert.deepEqual(r.map((x) => [x.item.name, x.guess]), [['牛乳', '飲料'], ['謎の品', '']]);
 });
 t('overstock: 90日変化なし+半年分以上で出る(89日は出ない)', () => {
   const mk = (idle) => it('a', 10, [[idle + 30, 20], [idle + 20, -1], [idle + 10, -1], [idle, -1]]);
@@ -245,13 +245,13 @@ t('learning: 学習済み/追跡中の件数と目安日数', () => {
 const LOCS = ['キッチン', '洗面所', '風呂・トイレ', '押入れ', '玄関', 'その他'];
 const raw = (name, extra = {}) => ({ name, qty: 1, category: '', location: '', ...extra });
 t('autoClassify: 学習が辞書より優先(家族が「牛乳」を飲料にしていればそれに従う)', () => {
-  const r = autoClassify(raw('牛乳'), [it('牛乳 1L', 1, [], { category: '飲料', location: '押入れ' })], { locs: LOCS });
-  assert.deepEqual([r.category, r.location, r.from.category, r.from.location], ['飲料', '押入れ', 'learned', 'learned']);
+  const r = autoClassify(raw('牛乳'), [it('牛乳 1L', 1, [], { category: '食品', location: '押入れ' })], { locs: LOCS });
+  assert.deepEqual([r.category, r.location, r.from.category, r.from.location], ['食品', '押入れ', 'learned', 'learned']);
 });
 t('autoClassify: 辞書へのフォールバック+置き場所の既定', () => {
   const r = autoClassify(raw('キャベツ'), [], { locs: LOCS });
-  assert.deepEqual([r.category, r.location, r.from.category, r.from.location], ['食品', 'キッチン', 'dict', 'category']);
-  const s = autoClassify(raw('シャンプー'), [], { locs: LOCS }); assert.deepEqual([s.category, s.location], ['洗剤・衛生', '洗面所']);
+  assert.deepEqual([r.category, r.location, r.from.category, r.from.location], ['食品', 'キッチン', 'dict', 'sub']);
+  const s = autoClassify(raw('シャンプー'), [], { locs: LOCS }); assert.deepEqual([s.category, s.location], ['美容・ケア', '洗面所']);
 });
 t('autoClassify: 名前による置き場所(食器用洗剤→キッチン、トイレ用→風呂・トイレ)', () => {
   assert.equal(autoClassify(raw('食器用洗剤'), [], { locs: LOCS }).location, 'キッチン');
@@ -262,7 +262,7 @@ t('autoClassify: トイレットペーパーはトイレ用品(風呂・トイ�
 });
 t('autoClassify: 低確信は空のまま(辞書に無い・既定のないカテゴリ)', () => {
   const r = autoClassify(raw('謎の品'), [], { locs: LOCS }); assert.deepEqual([r.category, r.location], ['', '']);
-  const k = autoClassify(raw('単3電池'), [], { locs: LOCS }); assert.deepEqual([k.category, k.location], ['消耗品', '']);
+  const k = autoClassify(raw('単3電池'), [], { locs: LOCS }); assert.deepEqual([k.category, k.location], ['日用品', '']);
 });
 t('autoClassify: 置き場所は locs に無い値を返さない', () => assert.equal(autoClassify(raw('キャベツ'), [], { locs: ['玄関'] }).location, ''));
 t('autoClassify: ユーザー指定は上書きしない(返さない)', () => {
@@ -279,16 +279,16 @@ t('autoClassify: 似ていない名前からは学習しない', () => {
   const r = autoClassify(raw('謎の品'), [it('牛乳', 1, [], { category: '飲料', location: '玄関' })], { locs: LOCS }); assert.equal(r.category, '');
 });
 t('autoClassify: 自動分類済み(auto)の品は学習元にしない(誤りの連鎖を防ぐ)', () => {
-  const r = autoClassify(raw('牛乳'), [it('牛乳', 1, [], { category: '飲料', location: '玄関', auto: true })], { locs: LOCS });
-  assert.equal(r.category, '食品');
+  const r = autoClassify(raw('牛乳'), [it('牛乳', 1, [], { category: '食品', location: '玄関', auto: true })], { locs: LOCS });
+  assert.equal(r.category, '飲料');
 });
 t('autoClassify: 複数の教師は類似度の合計で多数決', () => {
   const r = autoClassify(raw('卵'), [it('卵', 1, [], { category: '飲料' }), it('卵 ', 1, [], { category: '食品' }), it('卵\u3000', 1, [], { category: '食品' })], { locs: LOCS });
   assert.equal(r.category, '食品');
 });
 t('autoClassify: 自分自身は教師にしない / 名前が空なら何もしない', () => {
-  const me = it('牛乳', 1, [], { category: '飲料' }); me.category = '';
-  assert.equal(autoClassify(me, [me], { locs: LOCS }).category, '食品');
+  const me = it('牛乳', 1, [], { category: '食品' }); me.category = '';
+  assert.equal(autoClassify(me, [me], { locs: LOCS }).category, '飲料');
   assert.deepEqual([autoClassify(raw(''), [], {}).category, autoClassify(raw('  '), [], {}).location], ['', '']);
 });
 t('autoClassify: 学習で得た location が既定より優先、カテゴリだけ学習なら置き場所は既定', () => {
@@ -298,6 +298,50 @@ t('autoClassify: 学習で得た location が既定より優先、カテゴリ�
 t('plan.autoFill: 未分類の一括適用候補(埋める値があるものだけ)', () => {
   const r = plan([raw('キャベツ'), raw('謎の品'), raw('米', { category: '食品', location: 'キッチン' })], NOW, { locs: LOCS }).autoFill;
   assert.deepEqual(r.map((x) => [x.item.name, x.category, x.location]), [['キャベツ', '食品', 'キッチン']]);
+});
+
+// ---- 自動分類(小分類・新しい置き場所・古い文字列) ----
+const NEWLOCS = ['冷蔵庫', '冷凍庫', 'パントリー', 'キッチン', '洗面所', 'お風呂', 'トイレ', '押入れ・収納', '玄関', 'ベランダ', '車', 'その他'];
+t('autoClassify: 小分類と、小分類ごとの既定の置き場所(牛乳→乳飲料・冷蔵庫、冷凍餃子→冷凍庫)', () => {
+  const a = autoClassify(raw('牛乳 1L'), [], { locs: NEWLOCS });
+  assert.deepEqual([a.category, a.sub, a.location, a.from.sub, a.from.location], ['飲料', '乳飲料', '冷蔵庫', 'dict', 'sub']);
+  const b = autoClassify(raw('冷凍餃子'), [], { locs: NEWLOCS }); assert.deepEqual([b.sub, b.location], ['冷凍食品', '冷凍庫']);
+  const c = autoClassify(raw('トイレ用洗剤'), [], { locs: NEWLOCS }); assert.deepEqual([c.category, c.sub, c.location], ['洗剤・掃除', 'トイレ', 'トイレ']);
+});
+t('autoClassify: 古い置き場所の一覧なら代替名に読み替える(冷凍庫→キッチン、トイレ→風呂・トイレ)', () => {
+  assert.equal(autoClassify(raw('冷凍餃子'), [], { locs: LOCS }).location, 'キッチン');
+  assert.equal(autoClassify(raw('トイレ用洗剤'), [], { locs: LOCS }).location, '風呂・トイレ');
+});
+t('autoClassify: 学習は大分類+小分類+置き場所を引き継ぐ(自由な小分類も可)', () => {
+  const r = autoClassify(raw('食パン 6枚'), [it('食パン', 1, [], { category: '食品', sub: '手作りパン', location: '玄関' })], { locs: NEWLOCS.concat('玄関') });
+  assert.deepEqual([r.category, r.sub, r.location, r.from.sub], ['食品', '手作りパン', '玄関', 'learned']);
+});
+t('autoClassify: 小分類は同じ大分類の教師からだけ学習し、auto の品は学習元にしない', () => {
+  const x = autoClassify(raw('ふりかけ'), [it('ふりかけ', 1, [], { category: '飲料', sub: 'お茶' })], { locs: NEWLOCS });
+  assert.equal(x.category, '飲料'); assert.equal(x.sub, 'お茶'); // 家族が飲料に分類したのでそれに従う
+  const y = autoClassify(raw('ふりかけ'), [it('ふりかけ', 1, [], { category: '食品', sub: '調味料・粉', auto: true })], { locs: NEWLOCS });
+  assert.deepEqual([y.category, y.sub], ['食品', '乾物']);
+});
+t('autoClassify: 手で選んだ大分類・小分類は上書きしない / 小分類は矛盾しないときだけ補う', () => {
+  const a = autoClassify(raw('牛乳', { category: '飲料' }), [], { locs: NEWLOCS }); assert.deepEqual([a.category, a.sub], ['', '乳飲料']);
+  const b = autoClassify(raw('牛乳', { category: '食品' }), [], { locs: NEWLOCS }); assert.equal(b.sub, '');
+  const c = autoClassify(raw('牛乳', { category: '飲料', sub: 'お酒' }), [], { locs: NEWLOCS }); assert.deepEqual([c.category, c.sub], ['', '']);
+});
+t('autoClassify: 古い大分類(洗剤・衛生/薬/消耗品)の品でも小分類・置き場所を補える', () => {
+  const a = autoClassify(raw('シャンプー', { category: '洗剤・衛生' }), [], { locs: NEWLOCS }); assert.deepEqual([a.sub, a.location], ['シャンプー・ボディ', '洗面所']);
+  const b = autoClassify(raw('ロキソニン', { category: '薬' }), [], { locs: NEWLOCS }); assert.equal(b.sub, '常備薬');
+  const c = autoClassify(raw('単3電池', { category: '消耗品' }), [], { locs: NEWLOCS }); assert.equal(c.sub, '電池・電球');
+});
+t('autoClassify: 教師の古い文字列(風呂・トイレ/押入れ)は新体系に読み替えて引き継ぐ', () => {
+  const r = autoClassify(raw('トイレ掃除ブラシ'), [it('トイレ掃除ブラシ', 1, [], { category: '洗剤・衛生', location: '風呂・トイレ' })], { locs: NEWLOCS });
+  assert.deepEqual([r.category, r.location], ['洗剤・掃除', 'トイレ']);
+});
+t('autoClassify: 結果に undefined を含めない・空の項目は空文字', () => {
+  const r = autoClassify(raw('謎の品'), [], { locs: NEWLOCS });
+  assert.equal(JSON.stringify(r).includes('undefined'), false); assert.deepEqual([r.category, r.sub, r.location], ['', '', '']);
+});
+t('plan.autoFill: 小分類も候補に入る', () => {
+  const r = plan([raw('牛乳')], NOW, { locs: NEWLOCS }).autoFill; assert.deepEqual(r.map((x) => [x.category, x.sub, x.location]), [['飲料', '乳飲料', '冷蔵庫']]);
 });
 
 console.log(`${pass} passed, ${fail} failed (total ${pass + fail})`);

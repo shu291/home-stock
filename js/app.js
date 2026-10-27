@@ -3,12 +3,12 @@ import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
 import { ocr, warmupOcr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
 import { scan, lookupName } from './barcode.js';
+import { CATS, LOCS, canonCategory, canonLocation, categoryOptions, locationOptions, matchCategory, matchLocation } from './taxonomy.js';
+import { guessClass } from './category.js';
 import { plan, daysLeft, expiryDays, withLog, autoClassify, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const CATS = ['食品', '飲料', '日用品', '洗剤・衛生', '薬', '消耗品', 'その他'];
-const LOCS = ['キッチン', '洗面所', '風呂・トイレ', '押入れ', '玄関', 'その他'];
 const SRC = { amazon: 'Amazon', rakuten: '楽天', receipt: 'レシート', paste: '貼り付け', manual: '手入力', barcode: 'バーコード' };
 
 let store, state = { user: null, household: null }, items = [], unsub = null, lastSig = '', syncMsg = '';
@@ -34,9 +34,9 @@ const saveQty = (old, next, opts) => save(withLog(old, next, Date.now(), opts));
 // category/location が空なら自動分類で補う(ユーザーが選んだ値は上書きしない)。補ったら auto:true
 const fillAuto = (rec) => {
   if (rec.category && rec.location) return rec;
-  const r = autoClassify(rec, items, { locs: LOCS });
-  const out = { ...rec, category: rec.category || r.category, location: rec.location || r.location };
-  return out.category !== (rec.category || '') || out.location !== (rec.location || '') ? { ...out, auto: true } : rec;
+  const r = autoClassify(rec, items, { locs: locationOptions(items) });
+  const out = { ...rec, category: rec.category || r.category, location: rec.location || r.location, ...(r.sub && !rec.sub ? { sub: r.sub } : {}) };
+  return out.category !== (rec.category || '') || out.location !== (rec.location || '') ? { ...out, auto: true } : out;
 };
 // 「今はしない」の記録(端末内のみ。60日たつと再評価される)
 const DKEY = 'hs-dismiss', DISMISS_MS = 60 * 864e5;
@@ -45,7 +45,7 @@ const undismiss = async (ks) => { try { const o = dismissed(); ks.forEach((k) =>
 const dismiss = (k) => { try { localStorage.setItem(DKEY, JSON.stringify({ ...dismissed(), [k]: Date.now() })); } catch {} };
 // 分析結果は品目が変わるか1時間たつまで使い回す
 let planMemo = { sig: '', v: null };
-const getPlan = () => { const sig = lastSig + Math.floor(Date.now() / 36e5); return planMemo.sig === sig ? planMemo.v : (planMemo = { sig, v: plan(items, Date.now(), { locs: LOCS }) }).v; };
+const getPlan = () => { const sig = lastSig + Math.floor(Date.now() / 36e5); return planMemo.sig === sig ? planMemo.v : (planMemo = { sig, v: plan(items, Date.now(), { locs: locationOptions(items) }) }).v; };
 const etaText = (d) => (d < 1 ? 'あと1日未満' : d <= 180 ? `あと約${Math.round(d)}日` : '半年以上もちそう');
 
 // ---------- 画面 ----------
@@ -113,7 +113,7 @@ function renderStock(v) {
   const chipset = (arr, cur, k) => `<button class="chip ${cur ? '' : 'on'}" data-${k}="" aria-pressed="${!cur}">すべて</button>${arr.map((c) => `<button class="chip ${cur === c ? 'on' : ''}" data-${k}="${esc(c)}" aria-pressed="${cur === c}">${esc(c)}</button>`).join('')}`;
   v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="row"><div class="sw"><input id="q" type="search" enterkeyhint="search" placeholder="さがす(ひらがなでもOK)" aria-label="品名でさがす" autocomplete="off" value="${esc(q)}"><button class="x" id="qx" aria-label="入力を消す" ${q ? '' : 'hidden'}>×</button></div><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>
   <div class="fbar"><button class="b ${nf ? 'on' : ''}" id="ftg" aria-expanded="${filterOpen}" aria-controls="fp">絞り込み${nf ? `(${nf})` : ''} ${filterOpen ? '▴' : '▾'}</button><select id="srt" aria-label="並び順">${SORTS.map(([k, t]) => `<option value="${k}" ${k === sortKey ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-  ${filterOpen ? `<div id="fp"><div class="fgroup" id="fg1">カテゴリ</div><div class="chips" role="group" aria-labelledby="fg1">${chipset(CATS, cat, 'cat')}</div><div class="fgroup" id="fg2">置き場所</div><div class="chips" role="group" aria-labelledby="fg2">${chipset(LOCS, loc, 'loc')}</div></div>` : ''}<div id="lst"></div>`;
+  ${filterOpen ? `<div id="fp"><div class="fgroup" id="fg1">カテゴリ</div><div class="chips" role="group" aria-labelledby="fg1">${chipset(categoryOptions(items), cat, 'cat')}</div><div class="fgroup" id="fg2">置き場所</div><div class="chips" role="group" aria-labelledby="fg2">${chipset(locationOptions(items), loc, 'loc')}</div></div>` : ''}<div id="lst"></div>`;
   const again = () => { hold.until = 0; renderStock(v); };
   $('#q').oninput = (e) => { q = e.target.value; $('#qx').hidden = !q; hold.until = 0; renderList(); };
   $('#qx').onclick = () => { q = ''; $('#q').value = ''; $('#qx').hidden = true; hold.until = 0; renderList(); $('#q').focus(); };
@@ -132,11 +132,11 @@ function renderList() {
     std: (a, b) => isLow(b) - isLow(a) || nameCmp(a, b), name: nameCmp,
     expiry: (a, b) => (expiryDays(a, now) ?? 1e9) - (expiryDays(b, now) ?? 1e9) || nameCmp(a, b),
     eta: (a, b) => (a.qty <= 0 ? -1 : daysLeft(a, now) ?? 1e9) - (b.qty <= 0 ? -1 : daysLeft(b, now) ?? 1e9) || nameCmp(a, b),
-    loc: (a, b) => (LOCS.indexOf(a.location) + 99) % 99 - (LOCS.indexOf(b.location) + 99) % 99 || nameCmp(a, b),
+    loc: (a, b) => (LOCS.indexOf(canonLocation(a.location, a.name)) + 99) % 99 - (LOCS.indexOf(canonLocation(b.location, b.name)) + 99) % 99 || nameCmp(a, b),
     recent: (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0),
   }[sortKey];
   const fq = fold(q);
-  const list = items.filter((i) => (!cat || i.category === cat) && (!loc || i.location === loc) && (!fq || fold(i.name).includes(fq)));
+  const list = items.filter((i) => matchCategory(i, cat) && matchLocation(i, loc) && (!fq || fold(i.name).includes(fq)));
   if (now < hold.until) { const ix = new Map(hold.ids.map((id, n) => [id, n])); list.sort((a, b) => (ix.get(a.id) ?? 1e9) - (ix.get(b.id) ?? 1e9)); }
   else list.sort(cmp);
   hold.ids = list.map((i) => i.id);
@@ -207,7 +207,7 @@ function aiCards() {
     const nc = fills.filter((x) => x.category).length, nl = fills.filter((x) => x.location).length;
     cs.push({ type: 'auto', key: `auto:${hash(fills.map((x) => x.item.id).sort().join())}`, title: `分類がまだの${fills.length}件に、自動で分類をつけます`,
       body: `カテゴリ ${nc}件・置き場所 ${nl}件を補います(すでに入っている値は変えません)。<br>${fills.slice(0, 6).map((x) => `${nm(x.item)}→${esc([x.item.category ? '' : x.category, x.item.location ? '' : x.location].filter(Boolean).join(' / '))}`).join('<br>')}${fills.length > 6 ? `<br>ほか${fills.length - 6}件` : ''}<br><span class="sub">家族が付けた分類(類似名)があればそれを優先し、なければ品名の辞書で推定します。違っていたら在庫の編集で直してください(「自動」の印が付きます)。</span>`,
-      ok: { label: `${fills.length}件に適用`, fn: () => Promise.all(fills.map((x) => save({ ...x.item, category: x.item.category || x.category, location: x.item.location || x.location, auto: true }))) } });
+      ok: { label: `${fills.length}件に適用`, fn: () => Promise.all(fills.map((x) => save({ ...x.item, category: x.item.category || x.category, location: x.item.location || x.location, ...(x.sub && !x.item.sub ? { sub: x.sub } : {}), auto: true }))) } });
   }
   for (const { item: i, idleDays, days } of p.overstock) cs.push({ type: 'over', key: `over:${i.id}`, title: `${nm(i)}は十分あります`,
     body: `${idleDays}日間動きがなく、${i.qty}個あります${days === null ? '' : `(いまのペースで${days > 365 ? '1年以上' : `約${Math.round(days)}日`}分)`}。しばらく買わなくて大丈夫そうです。`, ok: null, no: '見ました' });
@@ -437,8 +437,10 @@ function startReview(cands, raw) {
 // 確認前の候補はすべて自動の推定(取り込み時の辞書推定を含む)なので、家族の学習結果があればそちらを優先する
 const autoDraft = (c) => {
   if (c.auto === false) return;
-  const cat = autoClassify({ name: c.name || '', category: '', location: '' }, items, { locs: LOCS }).category || c.category || '';
+  const r = autoClassify({ name: c.name || '', category: '', location: '' }, items, { locs: locationOptions(items) });
+  const cat = r.category || canonCategory(c.category || '', guessClass(c.name || '').category); // 解析が付けた古い大分類(洗剤・衛生など)は新体系の名前にそろえる
   if (cat) { c.category = cat; c.auto = true; }
+  if (r.category && r.sub) c.sub = r.sub; else delete c.sub;
 };
 
 // draft が出来上がっていれば確認画面を開く(レシートは startPhotos/addReceipt で作成済み)
@@ -582,7 +584,7 @@ function reviewDialog() {
     e.onfocus = () => { if (!flagsOf(draft[n])?.nm) return; const v = e.value; e.select(); setTimeout(() => e.value === v && e.select(), 0); }; // 崩れた名前は全選択 → そのまま打てば置き換わる/候補が出る
     e.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); const nx = flagged().find((i) => i > n); (nx === undefined ? d.querySelector(`[data-pr="${n}"]`) : d.querySelector(`[data-nm="${nx}"]`)).focus(); } }; // 次へ: 要確認の行が続くならそこへ(金額は合っていることが多い)
   });
-  d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { draft[e.dataset.ct].category = e.value; draft[e.dataset.ct].auto = false; e.closest('.rv').querySelector('.auto')?.remove(); }));
+  d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { draft[e.dataset.ct].category = e.value; delete draft[e.dataset.ct].sub; draft[e.dataset.ct].auto = false; e.closest('.rv').querySelector('.auto')?.remove(); }));
   d.querySelectorAll('[data-q]').forEach((e) => (e.oninput = () => (draft[e.dataset.q].qty = Math.max(1, +e.value || 1))));
   d.querySelectorAll('[data-pr]').forEach((e) => {
     const n = +e.dataset.pr;
@@ -622,8 +624,8 @@ function reviewDialog() {
     for (const c of draft.filter((x) => x.on && x.name.trim())) {
       const ex = byName.get(norm(c.name));
       const keys = c.srcKey ? [c.srcKey] : [];
-      let rec = ex ? { ...ex, qty: ex.qty + c.qty, category: ex.category || c.category || '', boughtAt: c.boughtAt || ex.boughtAt || '', srcKeys: [...(ex.srcKeys || []), ...keys] }
-        : { name: c.name.trim(), qty: c.qty, category: c.category || '', location: '', minQty: 0, buyQty: 1, price: c.price || 0, boughtAt: c.boughtAt || '', source: c.source, srcKeys: keys };
+      let rec = ex ? { ...ex, qty: ex.qty + c.qty, category: ex.category || c.category || '', ...(!ex.category && !ex.sub && c.sub ? { sub: c.sub } : {}), boughtAt: c.boughtAt || ex.boughtAt || '', srcKeys: [...(ex.srcKeys || []), ...keys] }
+        : { name: c.name.trim(), qty: c.qty, category: c.category || '', ...(c.sub ? { sub: c.sub } : {}), location: '', minQty: 0, buyQty: 1, price: c.price || 0, boughtAt: c.boughtAt || '', source: c.source, srcKeys: keys };
       rec = fillAuto(rec); if (c.auto && c.category && !ex?.category) rec.auto = true;
       rec = withLog(ex || null, rec); // 数量の履歴を追記
       save(rec).catch(() => {}); byName.set(norm(c.name), rec); n++; // 送信は待たず、失敗は toast で知らせる
@@ -649,29 +651,37 @@ async function barcodeAdd() {
 }
 
 // 読み取った番号の登録フォーム。登録済みなら数量を足す。戻り値: 続けるか
-function barcodeForm(d, code) {
-  return new Promise((resolve) => {
-    const ex = items.find((i) => i.barcode === code);
+// 名前の検索・見つからないときの案内・パッケージ文字の読み取り(OCR)は lookup-ui.js。登録すると、品目にこの番号(barcode)が付き、次からは検索せずに出る
+function barcodeForm(d, code0) {
+  return new Promise(async (resolve) => {
+    let bc, ui;
+    try { [bc, ui] = await Promise.all([import('./barcode.js'), import('./lookup-ui.js')]); } // barcode.js は読み込み済み
+    catch { toast('読み込みに失敗しました。通信を確認して、もう一度お試しください'); return resolve(false); }
+    const code = bc.canonCode(code0); // 12桁(UPC-A)・13桁・UPC-E の表記の違いをそろえる
+    const ex = items.find((i) => bc.canonCode(i.barcode) === code);
     const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
     d.innerHTML = `<form id="b-form" autocomplete="off"><h3 id="dlg-h">${ex ? '登録済みの商品' : '新しい商品'}</h3><div class="sub">バーコード ${esc(code)}</div>
-    <label>名前</label><input id="b-n" value="${esc(ex?.name || '')}" placeholder="${ex ? '' : '商品名を検索中…'}">
+    <label for="b-n">名前</label><input id="b-n" value="${esc(ex?.name || '')}" placeholder="${ex ? '' : '商品名を検索中…'}">
+    <div class="sub" id="b-note" role="status" aria-live="polite" style="margin-top:4px"></div><div id="b-help" hidden></div>
     <div class="grid2"><div><label>${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" inputmode="numeric" enterkeyhint="done" min="1" value="1"></div>
     <div><label>カテゴリ</label><select id="b-c">${opts(CATS, ex?.category)}</select></div></div>
     <div class="btns" style="margin-top:12px"><button type="button" class="b" id="bx">終了</button><button type="submit" class="b p grow" id="bok">${ex ? '数量を追加して次へ' : '登録して次へ'}</button></div></form>`;
-    const n = d.querySelector('#b-n'), c = d.querySelector('#b-c'); let typed = false;
+    const n = d.querySelector('#b-n'), c = d.querySelector('#b-c'); let typed = false, stopUi = () => {};
     n.oninput = () => (typed = true);
     c.onchange = () => (c.dataset.auto = '');
-    if (!ex) lookupName(code).then((name) => {
-      if (!typed && name) { n.value = name; if (!c.value) { c.value = autoClassify({ name, category: '', location: '' }, items, { locs: LOCS }).category; c.dataset.auto = c.value ? '1' : ''; } }
-      else if (!name) n.placeholder = '商品名を入力(見つかりませんでした)';
-    });
-    d.querySelector('#bx').onclick = () => resolve(false);
+    const apply = (name, fromOcr) => { // 検索結果・OCRの候補を名前欄へ。カテゴリは名前から推定(選択済みなら変えない)
+      n.value = name; if (fromOcr) typed = true;
+      if (!c.value || c.dataset.auto) { const g = autoClassify({ name, category: '', location: '' }, items, { locs: LOCS }).category; if (g || c.dataset.auto) { c.value = g; c.dataset.auto = g ? '1' : ''; } }
+    };
+    if (!ex) stopUi = ui.mountLookup(d, { code, input: n, apply, isTyped: () => typed });
+    d.querySelector('#bx').onclick = () => { stopUi(); resolve(false); };
     d.querySelector('#b-form').onsubmit = (ev) => {
       ev.preventDefault();
       const name = n.value.trim(); if (!name) return toast('名前を入れてください');
       const add = Math.max(1, +d.querySelector('#b-q').value || 1);
       const same = ex || items.find((i) => norm(i.name) === norm(name));
       const auto = !!c.dataset.auto && !!c.value;
+      stopUi();
       (same ? saveQty(same, { ...same, qty: same.qty + add, barcode: code, category: same.category || c.value, ...(auto && !same.category ? { auto: true } : {}) })
         : saveQty(null, { ...fillAuto({ name, qty: add, category: c.value, location: '', minQty: 0, buyQty: 1, barcode: code, source: 'barcode' }), ...(auto ? { auto: true } : {}) })).catch(() => {});
       toast(`${name} を追加しました`); resolve(true);
@@ -684,6 +694,7 @@ function barcodeForm(d, code) {
 function editDialog(it, memo, focus) {
   const d = $('#dlg'); const x = it || { name: '', qty: 1, minQty: 0, buyQty: 1, category: '', location: '', expiry: '', source: 'manual' };
   const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
+  const xc = canonCategory(x.category, guessClass(x.name).category), xl = canonLocation(x.location, x.name); // 古い版の名前は新体系の名前で表示(保存すると新しい名前になる)
   d.innerHTML = `<form id="f-form" autocomplete="off"><h3 id="dlg-h" ${it ? 'tabindex="-1" autofocus' : ''}>${it ? '編集' : '追加'}</h3>${memo ? `<p class="sub">読み取り結果(参考): <br>${esc(memo.slice(0, 200))}</p>` : ''}
   <label for="f-n">名前</label><input id="f-n" ${it ? '' : 'autofocus list="f-names"'} enterkeyhint="done" autocorrect="off" value="${esc(x.name)}">${it ? '' : `<datalist id="f-names">${items.map((i) => `<option value="${esc(i.name)}">`).join('')}</datalist>`}
   <div class="sub" id="f-dup" role="status"></div>
@@ -692,19 +703,19 @@ function editDialog(it, memo, focus) {
   <div class="grid2"><div><label for="f-m">買い足しライン(この数になったら買い物リストに出す)</label><input id="f-m" type="number" inputmode="numeric" min="0" value="${x.minQty || 0}"></div>
   <div><label for="f-b">買うときの個数</label><input id="f-b" type="number" inputmode="numeric" min="1" value="${x.buyQty || 1}"></div>
   <div><label for="f-e">賞味・使用期限</label><input id="f-e" type="date" value="${esc(x.expiry || '')}"></div><div></div>
-  <div><label for="f-c">カテゴリ</label><select id="f-c">${opts(CATS, x.category)}</select></div><div><label for="f-l">置き場所</label><select id="f-l">${opts(LOCS, x.location)}</select></div></div>
+  <div><label for="f-c">カテゴリ</label><select id="f-c">${opts(categoryOptions(items), xc)}</select></div><div><label for="f-l">置き場所</label><select id="f-l">${opts(locationOptions(items), xl)}</select></div></div>
   <div class="sub" id="f-h"></div></details>
   <div class="btns" style="margin-top:12px">${it ? '' : '<button type="button" class="b" id="again" style="order:2">続けて追加</button>'}<button type="submit" class="b p grow" id="ok" style="order:3">${it ? '保存' : '追加'}</button><button type="button" class="b" id="cx" style="order:1">やめる</button></div>
   ${it ? '<div class="danger"><button type="button" class="b d" id="del" style="width:100%">この品目を削除</button></div>' : ''}</form>`; // Tab順は 続けて追加→追加→やめる(見た目は やめる・続けて追加・追加)
   // 名前から分類の候補を事前選択する。すでに選んである(または保存済みの)欄は変えない
-  const fC = $('#f-c'), fL = $('#f-l'); let fixC = !!x.category, fixL = !!x.location, sugC = '', sugL = '';
+  const fC = $('#f-c'), fL = $('#f-l'); let fixC = !!x.category, fixL = !!x.location, sugC = '', sugL = '', sugS = '';
   const sum = () => { const t = [+$('#f-m').value ? `${$('#f-m').value}以下で買い足し` : '', $('#f-e').value ? `期限 ${dateJa($('#f-e').value)}` : '', fC.value, fL.value].filter(Boolean).join(' ・ '); $('#f-sum').textContent = `くわしく設定${t ? `(${t})` : ''}`; };
   fC.onchange = () => { fixC = true; sugC = ''; showHint(); }; fL.onchange = () => { fixL = true; sugL = ''; showHint(); };
   const showHint = () => { $('#f-h').textContent = sugC || sugL ? `自動の候補: ${[sugC, sugL].filter(Boolean).join(' / ')}(変更できます)` : ''; sum(); };
   const dupOf = () => (it ? null : items.find((i) => norm(i.name) === norm($('#f-n').value) && $('#f-n').value.trim()));
   const suggest = () => {
-    const r = autoClassify({ id: x.id, name: $('#f-n').value, category: fixC ? fC.value : '', location: fixL ? fL.value : '' }, items, { locs: LOCS });
-    if (!fixC) { fC.value = sugC = r.category; }
+    const r = autoClassify({ id: x.id, name: $('#f-n').value, category: fixC ? fC.value : '', location: fixL ? fL.value : '' }, items, { locs: locationOptions(items) });
+    sugS = r.sub; if (!fixC) { fC.value = sugC = r.category; }
     if (!fixL) { fL.value = sugL = r.location; }
     const ex = dupOf();
     $('#f-dup').textContent = ex ? `「${ex.name}」は登録済みです(いま ${ex.qty})。追加すると数量が足されます。` : '';
@@ -723,9 +734,11 @@ function editDialog(it, memo, focus) {
     if (ex) saveQty(ex, { ...ex, qty: ex.qty + qty }).catch(() => {});
     else {
       const rec = { ...x, name, qty, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: fC.value, location: fL.value };
+      if (rec.sub && canonCategory(fC.value, '') !== xc) delete rec.sub; // 大分類を変えたら古い小分類は外す
       // 自動の候補をそのまま使った(または以前の自動分類から変えていない)なら「自動」の印を付ける
-      const keep = x.auto && fC.value === (x.category || '') && fL.value === (x.location || '');
+      const keep = x.auto && fC.value === xc && fL.value === xl;
       if (keep || (sugC && fC.value === sugC) || (sugL && fL.value === sugL)) rec.auto = true; else delete rec.auto;
+      if (rec.auto && sugS && !rec.sub) rec.sub = sugS; // 自動分類のときだけ小分類も自動で補う(手で選んだ分類には足さない)
       saveQty(it || null, rec).catch(() => {}); // 送信は待たない(オフラインでも閉じる)。失敗は toast で知らせる
     }
     toast(it ? `「${name}」を保存しました` : ex ? `「${name}」に ${qty} 足しました` : `「${name}」を追加しました`);
