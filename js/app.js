@@ -16,7 +16,15 @@ let tab = 'stock', q = '', cat = '', loc = '';
 let draft = []; // 取り込み確認中の候補
 let receipts = []; // 確認中のレシートごとの {store, date, total, tax, adjust}。draft の rid が添字
 
-const toast = (m) => { const t = $('#toast'); t.textContent = m; t.classList.add('on'); setTimeout(() => t.classList.remove('on'), 2200); };
+// undo があれば「元に戻す」ボタンを付けて長めに出す。popover(最前面)なのでダイアログの上にも出る
+let toastT;
+const hideToast = () => { const t = $('#toast'); t.classList.remove('on'); try { t.hidePopover?.(); } catch {} };
+const toast = (m, undo) => {
+  const t = $('#toast'); clearTimeout(toastT); t.textContent = m;
+  if (undo) { const b = document.createElement('button'); b.textContent = '元に戻す'; b.onclick = async () => { hideToast(); try { await undo(); toast('元に戻しました'); } catch {} }; t.append(b); }
+  t.classList.add('on'); try { if (!t.matches(':popover-open')) t.showPopover?.(); } catch {}
+  toastT = setTimeout(hideToast, undo ? 5000 : 2200);
+};
 // 保存に失敗したら理由を出す(これが無いと「追加したのに増えない」原因が見えない)
 const save = (rec) => store.save(rec).catch((e) => { toast(`保存できませんでした: ${e.code || e.message}`); throw e; });
 const isLow = (i) => i.minQty > 0 && i.qty <= i.minQty;
@@ -44,7 +52,10 @@ function render() {
   $('#who').textContent = state.user ? `${state.household?.name ?? ''} / ${state.user.name}${syncMsg}` : '';
   const nb = state.household ? aiCards().length : 0;
   $('#tabs [data-tab=ai]').innerHTML = `提案${nb ? `<span class="bd">${nb}</span>` : ''}`;
+  $('#addnav').hidden = !state.household;
   const v = $('#view');
+  // 在庫タブは検索欄を作り直さない(入力中・日本語変換中に消えるため)。一覧だけ更新する
+  if (state.household && tab === 'stock' && $('#lst') && $('#q')) return renderList();
   if (!state.user) return (v.innerHTML = `<div class="empty"><p>家族みんなで使う在庫管理</p><button class="b p" id="login">Googleでログイン</button></div>`, $('#login').onclick = () => store.signIn());
   if (!state.household) return renderSetup(v);
   ({ stock: renderStock, shop: renderShop, ai: renderAi, import: renderImport, family: renderFamily })[tab](v);
@@ -52,8 +63,10 @@ function render() {
 
 function renderSetup(v) {
   v.innerHTML = `<div class="card"><h3>はじめに</h3><p class="sub">家族のだれか1人が「新しく作る」、ほかの人は「家族コード」で参加します。</p>
-  <label>家の名前</label><input id="hn" value="うちの家"><button class="b p" id="mk" style="margin-top:8px">新しく作る</button></div>
-  <div class="card"><label>家族コードで参加</label><input id="jc" placeholder="10文字のコード" autocapitalize="characters"><button class="b" id="jn" style="margin-top:8px">参加する</button></div>`;
+  <label>家の名前</label><input id="hn" value="うちの家" enterkeyhint="done"><button class="b p" id="mk" style="margin-top:8px;width:100%">新しく作る</button></div>
+  <div class="card"><label>家族コードで参加(家族から届いた10文字を貼り付け)</label><input id="jc" placeholder="10文字のコード" autocapitalize="characters" autocomplete="off" enterkeyhint="go"><button class="b" id="jn" style="margin-top:8px;width:100%">参加する</button></div>`;
+  $('#hn').onkeydown = (e) => { if (e.key === 'Enter') $('#mk').click(); };
+  $('#jc').onkeydown = (e) => { if (e.key === 'Enter') $('#jn').click(); };
   $('#mk').onclick = () => store.createHousehold($('#hn').value.trim() || 'うちの家').catch((e) => toast(e.message));
   $('#jn').onclick = () => store.joinHousehold($('#jc').value).catch(() => toast('参加できませんでした。コードを確認してください'));
 }
@@ -61,45 +74,75 @@ function renderSetup(v) {
 // 期限は7日以内/切れを目立たせる。「あと約N日」は消費ペースを学習済みの品だけ
 function expiryHtml(i) {
   const d = expiryDays(i, Date.now());
-  if (d === null) return i.expiry ? ' ・ 期限 ' + esc(i.expiry) : '';
-  if (d < 0) return ` ・ <span class="warn">期限切れ(${esc(i.expiry)})</span>`;
-  return d <= 7 ? ` ・ <span class="warn">期限まであと${d}日</span>` : ' ・ 期限 ' + esc(i.expiry);
+  if (d === null) return i.expiry ? `<span class="t">期限 ${esc(i.expiry)}</span>` : '';
+  if (d < 0) return `<span class="t warn">期限切れ(${esc(i.expiry)})</span>`;
+  return d <= 7 ? `<span class="t warn">期限まであと${d}日</span>` : `<span class="t">期限 ${esc(i.expiry)}</span>`;
 }
 function etaHtml(i) {
   const d = i.qty > 0 ? daysLeft(i, Date.now()) : null;
-  return d === null ? '' : ` ・ <span class="eta ${d <= 7 ? 'warn' : ''}">${etaText(d)}</span>`;
+  return d === null ? '' : `<span class="t eta ${d <= 7 ? 'warn' : ''}">${etaText(d)}</span>`;
 }
 
+// −/＋ を押した直後は並び順を保つ(押した品が「残りわずか」で先頭へ飛び、次のタップが別の品に当たるのを防ぐ)
+let hold = { until: 0, ids: [] };
 function renderStock(v) {
-  const list = items.filter((i) => (!cat || i.category === cat) && (!loc || i.location === loc) && (!q || norm(i.name).includes(norm(q))))
-    .sort((a, b) => isLow(b) - isLow(a) || a.name.localeCompare(b.name, 'ja'));
-  const chips = (arr, cur, k) => `<div class="chips"><button class="chip ${cur ? '' : 'on'}" data-${k}="">すべて</button>${arr.map((c) => `<button class="chip ${cur === c ? 'on' : ''}" data-${k}="${esc(c)}">${esc(c)}</button>`).join('')}</div>`;
-  v.innerHTML = `<div class="row"><input id="q" type="search" placeholder="さがす" value="${esc(q)}"><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>${chips(CATS, cat, 'cat')}${chips(LOCS, loc, 'loc')}` +
-    (list.length ? list.map((i) => `<div class="card item row ${isLow(i) ? 'low' : ''}" data-id="${i.id}">
-      <div class="grow" data-edit><div class="nm">${esc(i.name)}</div><div class="sub">${esc(i.location || '')} ${esc(i.category || '')}${i.auto ? '<span class="auto" title="自動で分類しました">自動</span>' : ''}${isLow(i) ? ' ・ 残りわずか' : ''}${expiryHtml(i)}${etaHtml(i)}</div></div>
-      <button class="b" data-d="-1">−</button><div class="qty">${i.qty}</div><button class="b" data-d="1">＋</button></div>`).join('')
-      : `<div class="empty">まだ登録がありません。<br>右下の＋か「取り込み」から追加できます</div>`) +
-    `<button class="b p fab" id="add">＋</button>`;
-  $('#q').oninput = (e) => { q = e.target.value; const p = e.target.selectionStart; renderStock(v); const n = $('#q'); n.focus(); n.setSelectionRange(p, p); };
-  v.querySelectorAll('[data-cat]').forEach((b) => (b.onclick = () => { cat = b.dataset.cat; render(); }));
-  v.querySelectorAll('[data-loc]').forEach((b) => (b.onclick = () => { loc = b.dataset.loc; render(); }));
-  v.querySelectorAll('.item').forEach((el) => {
-    const it = items.find((x) => x.id === el.dataset.id);
-    el.querySelector('[data-edit]').onclick = () => editDialog(it);
-    el.querySelectorAll('[data-d]').forEach((b) => (b.onclick = () => saveQty(it, { ...it, qty: Math.max(0, it.qty + +b.dataset.d) })));
-  });
-  $('#add').onclick = () => editDialog();
+  const chips = (arr, cur, k, all) => `<div class="chips" role="group" aria-label="${all}"><button class="chip ${cur ? '' : 'on'}" data-${k}="">${all}</button>${arr.map((c) => `<button class="chip ${cur === c ? 'on' : ''}" data-${k}="${esc(c)}" aria-pressed="${cur === c}">${esc(c)}</button>`).join('')}</div>`;
+  v.innerHTML = `<div class="row"><input id="q" type="search" enterkeyhint="search" placeholder="さがす" aria-label="品名でさがす" value="${esc(q)}"><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>${chips(CATS, cat, 'cat', 'すべて')}${chips(LOCS, loc, 'loc', 'すべて')}<div id="lst"></div>`;
+  $('#q').oninput = (e) => { q = e.target.value; hold.until = 0; renderList(); };
+  v.querySelectorAll('[data-cat]').forEach((b) => (b.onclick = () => { cat = b.dataset.cat; hold.until = 0; render(); }));
+  v.querySelectorAll('[data-loc]').forEach((b) => (b.onclick = () => { loc = b.dataset.loc; hold.until = 0; render(); }));
   $('#scan').onclick = barcodeAdd;
+  renderList();
 }
 
+function renderList() {
+  const el = $('#lst');
+  const list = items.filter((i) => (!cat || i.category === cat) && (!loc || i.location === loc) && (!q || norm(i.name).includes(norm(q))));
+  if (Date.now() < hold.until) { const ix = new Map(hold.ids.map((id, n) => [id, n])); list.sort((a, b) => (ix.get(a.id) ?? 1e9) - (ix.get(b.id) ?? 1e9)); }
+  else list.sort((a, b) => isLow(b) - isLow(a) || a.name.localeCompare(b.name, 'ja'));
+  hold.ids = list.map((i) => i.id);
+  const filtered = !!(cat || loc || q);
+  el.innerHTML = list.length ? list.map((i) => `<div class="card item row ${isLow(i) ? 'low' : ''}" data-id="${i.id}">
+      <div class="grow" data-edit role="button" tabindex="0" aria-label="${esc(i.name)}を編集"><div class="nm">${esc(i.name)}</div><div class="sub">${loc ? '' : `<span class="t">${esc(i.location || '')}</span>`}${cat ? '' : `<span class="t">${esc(i.category || '')}</span>`}${i.auto ? '<span class="auto" title="自動で分類しました">自動</span>' : ''}${expiryHtml(i)}${etaHtml(i)}</div></div>
+      <button class="b" data-d="-1" aria-label="${esc(i.name)}を1つ減らす">−</button><button class="qty" data-q aria-label="${esc(i.name)} 残り${i.qty}${isLow(i) ? '(残りわずか)' : ''}。タップで数を入力">${i.qty}</button><button class="b" data-d="1" aria-label="${esc(i.name)}を1つ増やす">＋</button></div>`).join('')
+    : filtered ? `<div class="empty">条件に合う品目がありません<br><button class="b" id="clr" style="margin-top:12px">絞り込みを解除</button></div>`
+    : `<div class="empty">まだ登録がありません。<br>下の＋ か「取り込み」から追加できます</div>`;
+  el.querySelectorAll('.item').forEach((row) => {
+    const it = items.find((x) => x.id === row.dataset.id), ed = row.querySelector('[data-edit]');
+    ed.onclick = () => editDialog(it);
+    ed.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); editDialog(it); } };
+    row.querySelector('[data-q]').onclick = () => editDialog(it, null, 'q');
+    row.querySelectorAll('[data-d]').forEach((b) => (b.onclick = () => {
+      const qty = Math.max(0, it.qty + +b.dataset.d); if (qty === it.qty) return;
+      hold.until = Date.now() + 6000;
+      saveQty(it, { ...it, qty }).catch(() => {});
+      toast(`${it.name}: ${it.qty} → ${qty}`, () => save(it));
+    }));
+  });
+  $('#clr')?.addEventListener('click', () => { q = cat = loc = ''; render(); });
+}
+
+// 買い物: 「買った」を押した品はその場に残して(取り消し線)、押し間違いはすぐ戻せる。タブを離れると消える
+const shopDone = new Map(); // id -> {old, sec, idx}
 function renderShop(v) {
-  const list = items.filter(isLow);
-  const soon = getPlan().soonOut.filter((x) => !isLow(x.item));
-  const buy = (i) => `<button class="b p" data-id="${i.id}">買った +${i.buyQty || 1}</button>`;
-  v.innerHTML = (list.length ? `<p class="sub">残りが「最低在庫」以下のものが自動で並びます。</p>` + list.map((i) => `<div class="card row"><div class="grow"><div class="nm">${esc(i.name)}</div><div class="sub">残り ${i.qty}(最低 ${i.minQty})</div></div>${buy(i)}</div>`).join('') : '')
-    + (soon.length ? `<h3 class="sec">もうすぐ切れそう</h3><p class="sub">使うペースからの予測です(使うほど正確になります)。</p>` + soon.map(({ item: i, days }) => `<div class="card row"><div class="grow"><div class="nm">${esc(i.name)}</div><div class="sub">残り ${i.qty} ・ <span class="warn">${i.qty > 0 ? etaText(days) : '切れています'}</span></div></div>${buy(i)}</div>`).join('') : '')
-    + (list.length || soon.length ? '' : `<div class="empty">買い足すものはありません 🎉<br><span class="sub">在庫の編集で「最低在庫」を設定すると、ここに出ます</span></div>`);
-  v.querySelectorAll('[data-id]').forEach((b) => (b.onclick = () => { const i = items.find((x) => x.id === b.dataset.id); saveQty(i, { ...i, qty: i.qty + (i.buyQty || 1), boughtAt: new Date().toISOString().slice(0, 10) }); }));
+  const secs = [items.filter(isLow).map((i) => ({ i })), getPlan().soonOut.filter((x) => !isLow(x.item)).map((x) => ({ i: x.item, days: x.days }))];
+  for (const [id, m] of shopDone) { const cur = items.find((x) => x.id === id); if (cur && !secs.flat().some((r) => r.i.id === id)) secs[m.sec].splice(Math.min(m.idx, secs[m.sec].length), 0, { i: cur }); }
+  const row = ({ i, days }, sec, idx) => {
+    const dn = shopDone.get(i.id);
+    if (dn) return `<div class="card row done"><div class="grow"><div class="nm">${esc(i.name)}</div><div class="sub">買いました(いま ${i.qty})</div></div><button class="b" data-undo="${i.id}">元に戻す</button></div>`;
+    const sub = sec === 0 ? `残り ${i.qty}(${i.minQty}以下で買い足し)` : `残り ${i.qty} ・ <span class="warn">${i.qty > 0 ? etaText(days) : '切れています'}</span>`;
+    return `<div class="card row"><div class="grow"><div class="nm">${esc(i.name)}</div><div class="sub">${sub}</div></div><button class="b p" data-id="${i.id}" data-sec="${sec}" data-idx="${idx}" aria-label="${esc(i.name)}を買った">買った +${i.buyQty || 1}</button></div>`;
+  };
+  const [list, soon] = secs;
+  v.innerHTML = (list.length ? `<p class="sub">残りが「買い足しライン」以下のものが自動で並びます。買ったら右のボタンを押してください。</p>` + list.map((r, n) => row(r, 0, n)).join('') : '')
+    + (soon.length ? `<h3 class="sec">もうすぐ切れそう</h3><p class="sub">使うペースからの予測です(使うほど正確になります)。</p>` + soon.map((r, n) => row(r, 1, n)).join('') : '')
+    + (list.length || soon.length ? '' : `<div class="empty">買い足すものはありません 🎉<br><span class="sub">在庫の編集で「買い足しライン」を設定すると、ここに出ます</span></div>`);
+  v.querySelectorAll('[data-id]').forEach((b) => (b.onclick = () => {
+    const i = items.find((x) => x.id === b.dataset.id);
+    shopDone.set(i.id, { old: i, sec: +b.dataset.sec, idx: +b.dataset.idx });
+    saveQty(i, { ...i, qty: i.qty + (i.buyQty || 1), boughtAt: new Date().toISOString().slice(0, 10) }).catch(() => { shopDone.delete(i.id); render(); });
+  }));
+  v.querySelectorAll('[data-undo]').forEach((b) => (b.onclick = () => { const m = shopDone.get(b.dataset.undo); shopDone.delete(b.dataset.undo); save(m.old).catch(() => {}); render(); }));
 }
 
 // ---------- かしこい提案(端末内の統計による推定。外部には送信しない) ----------
@@ -112,7 +155,7 @@ function aiCards() {
     body: `期限 ${esc(i.expiry)}(${expired ? `${-days}日前` : days === 0 ? '今日' : `あと${days}日`})・ 残り ${i.qty}`,
     ok: expired ? { label: '処分した(0にする)', fn: () => saveQty(i, { ...i, qty: 0, expiry: '' }, { skip: true }) } : null, ok2: expired ? { label: 'まだ使える(期限を消す)', fn: () => save({ ...i, expiry: '' }) } : null, no: expired ? '今はしない' : '確認した' });
   for (const { item: i, cur, sug, rate } of p.parSuggestions) cs.push({ key: `par:${i.id}:${sug.minQty}:${sug.buyQty}`, title: `${nm(i)}の在庫設定を見直しませんか`,
-    body: `最低在庫 ${cur.minQty} → <b>${sug.minQty}</b> ・ 1回に買う数 ${cur.buyQty} → <b>${sug.buyQty}</b><br>1日に約${rate.toFixed(2)}個のペースで使っている計算です(最低在庫は約1週間分、買う数は約2週間分)。`,
+    body: `買い足しライン ${cur.minQty} → <b>${sug.minQty}</b> ・ 1回に買う数 ${cur.buyQty} → <b>${sug.buyQty}</b><br>1日に約${rate.toFixed(2)}個のペースで使っている計算です(買い足しラインは約1週間分、買う数は約2週間分)。`,
     ok: { label: '適用', fn: () => save({ ...i, minQty: sug.minQty, buyQty: sug.buyQty }) } });
   for (const g of p.duplicates) cs.push({ key: `dup:${g.items.map((x) => x.id).sort().join(',')}`, title: '同じ品かもしれません',
     body: `${g.items.map((x) => `${nm(x)}(${x.qty})`).join(' と ')}<br>→ ${nm(g.keep)} <b>${g.merged.qty}</b>個にまとめます(数量は合算、バーコード・履歴は引き継ぎ)。`,
@@ -136,7 +179,16 @@ function renderAi(v) {
     (cs.length ? cs.map((c, n) => `<div class="card sg ${c.cls || ''}"><div class="nm">${c.title}</div><div class="sub sgb">${c.body}</div>
       <div class="row"><button class="b grow" data-no="${n}">${c.no || '今はしない'}</button>${c.ok2 ? `<button class="b grow" data-ok2="${n}">${c.ok2.label}</button>` : ''}${c.ok ? `<button class="b p grow" data-ok="${n}">${c.ok.label}</button>` : ''}</div></div>`).join('')
       : `<div class="empty">いまのところ提案はありません</div>`);
-  const run = (f) => async () => { try { await f(); toast('反映しました'); } catch {} render(); };
+  // 反映後に「元に戻す」: 反映で変わった品目だけ、反映前の内容に保存し直す(その間の他の人の変更は巻き込まない)
+  const run = (f) => async () => {
+    const snap = new Map(items.map((i) => [i.id, JSON.stringify(i)]));
+    try {
+      await f(); await new Promise((r) => setTimeout(r, 60));
+      const back = [...snap].filter(([id, j]) => { const c = items.find((x) => x.id === id); return !c || JSON.stringify(c) !== j; }).map(([, j]) => JSON.parse(j));
+      toast('反映しました', back.length ? async () => { for (const o of back) await save(o); } : null);
+    } catch {}
+    render();
+  };
   v.querySelectorAll('[data-no]').forEach((b) => (b.onclick = () => { dismiss(cs[b.dataset.no].key); render(); }));
   v.querySelectorAll('[data-ok]').forEach((b) => (b.onclick = run(cs[b.dataset.ok].ok.fn)));
   v.querySelectorAll('[data-ok2]').forEach((b) => (b.onclick = run(cs[b.dataset.ok2].ok2.fn)));
@@ -144,9 +196,11 @@ function renderAi(v) {
 
 function renderFamily(v) {
   const h = state.household;
-  v.innerHTML = `<div class="card"><h3>${esc(h.name)}</h3>${store.mode === 'cloud' ? `<p class="sub">家族に次のコードを伝えて、同じアプリで「家族コードで参加」してもらってください。</p><div class="code">${esc(h.id)}</div>` : `<p class="sub">いまは「お試しモード」です。家族で共有するには js/config.js に Firebase の設定が必要です(README参照)。</p>`}</div>
-  ${store.mode === 'cloud' ? '<button class="b" id="out">ログアウト</button>' : ''}`;
+  v.innerHTML = `<div class="card"><h3>${esc(h.name)}</h3>${store.mode === 'cloud' ? `<p class="sub">家族に次のコードを伝えて、同じアプリで「家族コードで参加」してもらってください。</p><div class="code" id="code">${esc(h.id)}</div><div class="row"><button class="b grow" id="cp">コードをコピー</button>${navigator.share ? '<button class="b p grow" id="sh">家族に送る</button>' : ''}</div>` : `<p class="sub">いまは「お試しモード」です。家族で共有するには js/config.js に Firebase の設定が必要です(README参照)。</p>`}</div>
+  ${store.mode === 'cloud' ? '<button class="b" id="out" style="margin-top:12px">ログアウト</button>' : ''}`;
   $('#out')?.addEventListener('click', () => store.signOut());
+  $('#cp')?.addEventListener('click', () => (navigator.clipboard?.writeText(h.id) ?? Promise.reject()).then(() => toast('コードをコピーしました'), () => toast('コピーできませんでした。コードを長押しして選んでください')));
+  $('#sh')?.addEventListener('click', () => navigator.share({ title: 'うちの在庫', text: `「うちの在庫」に参加してください。家族コード: ${h.id}`, url: location.href.split('#')[0] }).catch(() => {}));
 }
 
 function renderImport(v) {
@@ -227,20 +281,21 @@ function checkText(r, n) {
 
 function reviewDialog() {
   const d = $('#dlg'), st = d.scrollTop;
-  const row = (c, n) => `<div class="card rv"><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} style="width:auto" aria-label="登録する"><input class="grow" data-nm="${n}" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
+  const row = (c, n) => `<div class="card rv"><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
     <div class="rv2"><div><label>カテゴリ</label><select data-ct="${n}"><option value="">未設定</option>${CATS.map((x) => `<option ${x === c.category ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
-    <div><label>数量</label><input data-q="${n}" type="number" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" min="0" value="${c.price || ''}"></div></div>
+    <div><label>数量</label><input data-q="${n}" type="number" inputmode="numeric" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" inputmode="numeric" min="0" value="${c.price || ''}"></div></div>
     <div class="sub">${c.auto && c.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : ''}${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}</div></div>`;
   const head = (r, n) => { const k = checkText(r, n); return `<div class="card rc"><div class="grid2"><div><label>店名</label><input data-rs="${n}" value="${esc(r.store)}"></div><div><label>日付</label><input type="date" data-rd="${n}" value="${esc(r.date)}"></div></div>
-    <div class="grid2"><div><label>レシートの合計(円)</label><input type="number" min="0" data-rt="${n}" value="${r.total || ''}"></div><div class="chk ${k.cls}" data-ck="${n}" role="status">${k.t}</div></div></div>`; };
-  d.innerHTML = `<h3>この内容で登録しますか?</h3><p class="sub">名前・数量・金額・カテゴリを直せます。同じ名前が在庫にあれば数量を足します。</p>
+    <div class="grid2"><div><label>レシートの合計(円)</label><input type="number" inputmode="numeric" min="0" data-rt="${n}" value="${r.total || ''}"></div><div class="chk ${k.cls}" data-ck="${n}" role="status">${k.t}</div></div></div>`; };
+  d.innerHTML = `<h3 tabindex="-1" autofocus>この内容で登録しますか?</h3><p class="sub">名前・数量・金額・カテゴリを直せます。同じ名前が在庫にあれば数量を足します。</p>
   ${receipts.map(head).join('')}${draft.map(row).join('')}
   <div class="row" style="margin-top:8px"><button class="b grow" id="ad">＋ 品目を追加</button>${receipts.length ? '<label class="b grow filebtn">📷 別のレシートを追加<input type="file" id="more" accept="image/*" multiple hidden></label>' : ''}</div>
   <div class="sub" id="mst"></div>
-  <div class="row" style="margin-top:12px"><button class="b" id="cx">やめる</button><button class="b p grow" id="ok">登録</button></div>`;
+  <div class="row stickybar"><button class="b" id="cx">やめる</button><button class="b p grow" id="ok">登録</button></div>`;
+  const cnt = () => { const n = draft.filter((x) => x.on && x.name.trim()).length; $('#ok').textContent = `${n}件を登録`; $('#ok').disabled = !n; };
   const refresh = () => receipts.forEach((r, n) => { const k = checkText(r, n), e = d.querySelector(`[data-ck="${n}"]`); if (e) { e.className = `chk ${k.cls}`; e.textContent = k.t; } });
-  d.querySelectorAll('[data-on]').forEach((e) => (e.onchange = () => (draft[e.dataset.on].on = e.checked)));
-  d.querySelectorAll('[data-nm]').forEach((e) => (e.oninput = () => (draft[e.dataset.nm].name = e.value)));
+  d.querySelectorAll('[data-on]').forEach((e) => (e.onchange = () => { draft[e.dataset.on].on = e.checked; cnt(); }));
+  d.querySelectorAll('[data-nm]').forEach((e) => (e.oninput = () => { draft[e.dataset.nm].name = e.value; cnt(); }));
   d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { draft[e.dataset.ct].category = e.value; draft[e.dataset.ct].auto = false; e.closest('.rv').querySelector('.auto')?.remove(); }));
   d.querySelectorAll('[data-q]').forEach((e) => (e.oninput = () => (draft[e.dataset.q].qty = Math.max(1, +e.value || 1))));
   d.querySelectorAll('[data-pr]').forEach((e) => (e.oninput = () => { draft[e.dataset.pr].price = Math.max(0, +e.value || 0); refresh(); }));
@@ -276,6 +331,7 @@ function reviewDialog() {
     }
     d.close(); toast(`${n}件を登録しました`); tab = 'stock'; render();
   };
+  cnt();
   if (!d.open) d.showModal();
   d.scrollTop = st;
 }
@@ -284,7 +340,9 @@ function reviewDialog() {
 async function barcodeAdd() {
   const d = $('#dlg'); if (!d.open) d.showModal();
   for (;;) {
-    const code = await scan(d); if (!code) return d.close();
+    const sp = scan(d); // 番号入力欄で Enter でも決定できるようにする
+    d.querySelector('#bn')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') d.querySelector('#bg')?.click(); });
+    const code = await sp; if (!code) return d.close();
     if (!(await barcodeForm(d, code))) return d.close(); // false=終了 / true=続けて読む
   }
 }
@@ -294,11 +352,11 @@ function barcodeForm(d, code) {
   return new Promise((resolve) => {
     const ex = items.find((i) => i.barcode === code);
     const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
-    d.innerHTML = `<h3>${ex ? '登録済みの商品' : '新しい商品'}</h3><div class="sub">バーコード ${esc(code)}</div>
+    d.innerHTML = `<form id="b-form" autocomplete="off"><h3>${ex ? '登録済みの商品' : '新しい商品'}</h3><div class="sub">バーコード ${esc(code)}</div>
     <label>名前</label><input id="b-n" value="${esc(ex?.name || '')}" placeholder="${ex ? '' : '商品名を検索中…'}">
-    <div class="grid2"><div><label>${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" min="1" value="1"></div>
+    <div class="grid2"><div><label>${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" inputmode="numeric" enterkeyhint="done" min="1" value="1"></div>
     <div><label>カテゴリ</label><select id="b-c">${opts(CATS, ex?.category)}</select></div></div>
-    <div class="row" style="margin-top:12px"><button class="b" id="bx">終了</button><button class="b p grow" id="bok">${ex ? '数量を追加して次へ' : '登録して次へ'}</button></div>`;
+    <div class="row" style="margin-top:12px"><button type="button" class="b" id="bx">終了</button><button type="submit" class="b p grow" id="bok">${ex ? '数量を追加して次へ' : '登録して次へ'}</button></div></form>`;
     const n = d.querySelector('#b-n'), c = d.querySelector('#b-c'); let typed = false;
     n.oninput = () => (typed = true);
     c.onchange = () => (c.dataset.auto = '');
@@ -307,7 +365,8 @@ function barcodeForm(d, code) {
       else if (!name) n.placeholder = '商品名を入力(見つかりませんでした)';
     });
     d.querySelector('#bx').onclick = () => resolve(false);
-    d.querySelector('#bok').onclick = () => {
+    d.querySelector('#b-form').onsubmit = (ev) => {
+      ev.preventDefault();
       const name = n.value.trim(); if (!name) return toast('名前を入れてください');
       const add = Math.max(1, +d.querySelector('#b-q').value || 1);
       const same = ex || items.find((i) => norm(i.name) === norm(name));
@@ -320,43 +379,68 @@ function barcodeForm(d, code) {
 }
 
 // ---------- 編集 ----------
-function editDialog(it, memo) {
+// focus='q' なら数量欄にカーソルを置く。新規は名前欄、編集は何も置かない(キーボードを出さない)
+function editDialog(it, memo, focus) {
   const d = $('#dlg'); const x = it || { name: '', qty: 1, minQty: 0, buyQty: 1, category: '', location: '', expiry: '', source: 'manual' };
   const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
-  d.innerHTML = `<h3>${it ? '編集' : '追加'}</h3>${memo ? `<p class="sub">読み取り結果(参考): <br>${esc(memo.slice(0, 200))}</p>` : ''}
-  <label>名前</label><input id="f-n" value="${esc(x.name)}">
-  <div class="grid2"><div><label>数量</label><input id="f-q" type="number" min="0" value="${x.qty}"></div><div><label>最低在庫(これ以下で買い物リストへ)</label><input id="f-m" type="number" min="0" value="${x.minQty || 0}"></div>
-  <div><label>1回に買う数</label><input id="f-b" type="number" min="1" value="${x.buyQty || 1}"></div><div><label>賞味・使用期限</label><input id="f-e" type="date" value="${esc(x.expiry || '')}"></div>
-  <div><label>カテゴリ</label><select id="f-c">${opts(CATS, x.category)}</select></div><div><label>置き場所</label><select id="f-l">${opts(LOCS, x.location)}</select></div></div>
-  <div class="sub" id="f-h"></div>
-  <div class="row" style="margin-top:12px">${it ? '<button class="b d" id="del">削除</button>' : ''}<button class="b" id="cx">やめる</button><button class="b p grow" id="ok">保存</button></div>`;
+  d.innerHTML = `<form id="f-form" autocomplete="off"><h3 ${it ? 'tabindex="-1" autofocus' : ''}>${it ? '編集' : '追加'}</h3>${memo ? `<p class="sub">読み取り結果(参考): <br>${esc(memo.slice(0, 200))}</p>` : ''}
+  <label for="f-n">名前</label><input id="f-n" ${it ? '' : 'autofocus list="f-names"'} enterkeyhint="done" autocorrect="off" value="${esc(x.name)}">${it ? '' : `<datalist id="f-names">${items.map((i) => `<option value="${esc(i.name)}">`).join('')}</datalist>`}
+  <div class="sub" id="f-dup" role="status"></div>
+  <label for="f-q">数量</label><div class="row"><button type="button" class="b" id="f-qm" aria-label="1つ減らす">−</button><input id="f-q" type="number" inputmode="numeric" enterkeyhint="done" min="0" value="${x.qty}" style="text-align:center;font-size:20px;font-weight:700"><button type="button" class="b" id="f-qp" aria-label="1つ増やす">＋</button></div>
+  <details class="more"><summary id="f-sum"></summary>
+  <div class="grid2"><div><label for="f-m">買い足しライン(この数以下で買い物リストへ)</label><input id="f-m" type="number" inputmode="numeric" min="0" value="${x.minQty || 0}"></div>
+  <div><label for="f-b">1回に買う数</label><input id="f-b" type="number" inputmode="numeric" min="1" value="${x.buyQty || 1}"></div>
+  <div><label for="f-e">賞味・使用期限</label><input id="f-e" type="date" value="${esc(x.expiry || '')}"></div><div></div>
+  <div><label for="f-c">カテゴリ</label><select id="f-c">${opts(CATS, x.category)}</select></div><div><label for="f-l">置き場所</label><select id="f-l">${opts(LOCS, x.location)}</select></div></div>
+  <div class="sub" id="f-h"></div></details>
+  <div class="row" style="margin-top:12px"><button type="button" class="b" id="cx">やめる</button>${it ? '' : '<button type="button" class="b" id="again">続けて追加</button>'}<button type="submit" class="b p grow" id="ok">${it ? '保存' : '追加'}</button></div>
+  ${it ? '<button type="button" class="b d" id="del" style="width:100%;margin-top:16px">この品目を削除</button>' : ''}</form>`;
   // 名前から分類の候補を事前選択する。すでに選んである(または保存済みの)欄は変えない
   const fC = $('#f-c'), fL = $('#f-l'); let fixC = !!x.category, fixL = !!x.location, sugC = '', sugL = '';
+  const sum = () => { const t = [+$('#f-m').value ? `${$('#f-m').value}以下で買い足し` : '', $('#f-e').value ? `期限 ${$('#f-e').value}` : '', fC.value, fL.value].filter(Boolean).join(' ・ '); $('#f-sum').textContent = `くわしく設定${t ? `(${t})` : ''}`; };
   fC.onchange = () => { fixC = true; sugC = ''; showHint(); }; fL.onchange = () => { fixL = true; sugL = ''; showHint(); };
-  const showHint = () => { $('#f-h').textContent = sugC || sugL ? `自動の候補: ${[sugC, sugL].filter(Boolean).join(' / ')}(変更できます)` : ''; };
+  const showHint = () => { $('#f-h').textContent = sugC || sugL ? `自動の候補: ${[sugC, sugL].filter(Boolean).join(' / ')}(変更できます)` : ''; sum(); };
+  const dupOf = () => (it ? null : items.find((i) => norm(i.name) === norm($('#f-n').value) && $('#f-n').value.trim()));
   const suggest = () => {
     const r = autoClassify({ id: x.id, name: $('#f-n').value, category: fixC ? fC.value : '', location: fixL ? fL.value : '' }, items, { locs: LOCS });
     if (!fixC) { fC.value = sugC = r.category; }
     if (!fixL) { fL.value = sugL = r.location; }
+    const ex = dupOf();
+    $('#f-dup').textContent = ex ? `「${ex.name}」は登録済みです(いま ${ex.qty})。追加すると数量が足されます。` : '';
+    $('#ok').textContent = ex ? '数量を足す' : it ? '保存' : '追加';
     showHint();
   };
   $('#f-n').oninput = suggest; suggest();
+  ['f-m', 'f-e'].forEach((k) => ($(`#${k}`).oninput = sum));
+  const step = (n) => { const q = $('#f-q'); q.value = Math.max(0, (+q.value || 0) + n); };
+  $('#f-qm').onclick = () => step(-1); $('#f-qp').onclick = () => step(1);
   $('#cx').onclick = () => d.close();
-  $('#del')?.addEventListener('click', async () => { if (confirm('削除しますか?')) { await store.remove(it.id); d.close(); } });
-  $('#ok').onclick = async () => {
-    const name = $('#f-n').value.trim(); if (!name) return toast('名前を入れてください');
-    const rec = { ...x, name, qty: +$('#f-q').value || 0, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: fC.value, location: fL.value };
-    // 自動の候補をそのまま使った(または以前の自動分類から変えていない)なら「自動」の印を付ける
-    const keep = x.auto && fC.value === (x.category || '') && fL.value === (x.location || '');
-    if (keep || (sugC && fC.value === sugC) || (sugL && fL.value === sugL)) rec.auto = true; else delete rec.auto;
-    await saveQty(it || null, rec);
-    d.close();
+  $('#del')?.addEventListener('click', () => { d.close(); store.remove(it.id).catch((e) => toast(`削除できませんでした: ${e.code || e.message}`)); toast(`「${it.name}」を削除しました`, () => save(it)); });
+  const submit = (again) => {
+    const name = $('#f-n').value.trim(); if (!name) { toast('名前を入れてください'); $('#f-n').focus(); return; }
+    const qty = +$('#f-q').value || 0, ex = dupOf();
+    if (ex) saveQty(ex, { ...ex, qty: ex.qty + qty }).catch(() => {});
+    else {
+      const rec = { ...x, name, qty, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: fC.value, location: fL.value };
+      // 自動の候補をそのまま使った(または以前の自動分類から変えていない)なら「自動」の印を付ける
+      const keep = x.auto && fC.value === (x.category || '') && fL.value === (x.location || '');
+      if (keep || (sugC && fC.value === sugC) || (sugL && fL.value === sugL)) rec.auto = true; else delete rec.auto;
+      saveQty(it || null, rec).catch(() => {}); // 送信は待たない(オフラインでも閉じる)。失敗は toast で知らせる
+    }
+    toast(it ? `「${name}」を保存しました` : ex ? `「${name}」に ${qty} 足しました` : `「${name}」を追加しました`);
+    if (again) { editDialog(); $('#f-n').focus(); } else d.close();
   };
-  d.showModal();
+  $('#f-form').onsubmit = (e) => { e.preventDefault(); submit(false); };
+  $('#again')?.addEventListener('click', () => submit(true));
+  if (!d.open) d.showModal();
+  if (focus === 'q') { const q = $('#f-q'); q.focus(); q.select(); }
 }
 
 // ---------- 起動 ----------
-document.querySelectorAll('#tabs button').forEach((b) => (b.onclick = () => { tab = b.dataset.tab; render(); }));
+document.querySelectorAll('#tabs [data-tab]').forEach((b) => (b.onclick = () => { if (tab !== b.dataset.tab) { shopDone.clear(); scrollTo(0, 0); } tab = b.dataset.tab; render(); }));
+$('#addnav').onclick = () => state.household && editDialog();
+// 数量などの数字欄は、タップしたら全選択(そのまま打てば置き換わる)
+document.addEventListener('focusin', (e) => { if (e.target.matches?.('input[type=number]')) try { e.target.select(); } catch {} });
 (async () => {
   store = await createStore();
   await store.init((s) => {
