@@ -3,25 +3,28 @@ import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
 import { guessCategory } from './category.js';
 import { ocr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
+import { scan, lookupName } from './barcode.js';
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const CATS = ['食品', '飲料', '日用品', '洗剤・衛生', '薬', '消耗品', 'その他'];
 const LOCS = ['キッチン', '洗面所', '風呂・トイレ', '押入れ', '玄関', 'その他'];
-const SRC = { amazon: 'Amazon', rakuten: '楽天', receipt: 'レシート', paste: '貼り付け', manual: '手入力' };
+const SRC = { amazon: 'Amazon', rakuten: '楽天', receipt: 'レシート', paste: '貼り付け', manual: '手入力', barcode: 'バーコード' };
 
-let store, state = { user: null, household: null }, items = [], unsub = null;
+let store, state = { user: null, household: null }, items = [], unsub = null, lastSig = '', syncMsg = '';
 let tab = 'stock', q = '', cat = '', loc = '';
 let draft = []; // 取り込み確認中の候補
 let receipts = []; // 確認中のレシートごとの {store, date, total, tax, adjust}。draft の rid が添字
 
 const toast = (m) => { const t = $('#toast'); t.textContent = m; t.classList.add('on'); setTimeout(() => t.classList.remove('on'), 2200); };
+// 保存に失敗したら理由を出す(これが無いと「追加したのに増えない」原因が見えない)
+const save = (rec) => store.save(rec).catch((e) => { toast(`保存できませんでした: ${e.code || e.message}`); throw e; });
 const isLow = (i) => i.minQty > 0 && i.qty <= i.minQty;
 
 // ---------- 画面 ----------
 function render() {
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#who').textContent = state.user ? `${state.household?.name ?? ''} / ${state.user.name}` : '';
+  $('#who').textContent = state.user ? `${state.household?.name ?? ''} / ${state.user.name}${syncMsg}` : '';
   const v = $('#view');
   if (!state.user) return (v.innerHTML = `<div class="empty"><p>家族みんなで使う在庫管理</p><button class="b p" id="login">Googleでログイン</button></div>`, $('#login').onclick = () => store.signIn());
   if (!state.household) return renderSetup(v);
@@ -40,7 +43,7 @@ function renderStock(v) {
   const list = items.filter((i) => (!cat || i.category === cat) && (!loc || i.location === loc) && (!q || norm(i.name).includes(norm(q))))
     .sort((a, b) => isLow(b) - isLow(a) || a.name.localeCompare(b.name, 'ja'));
   const chips = (arr, cur, k) => `<div class="chips"><button class="chip ${cur ? '' : 'on'}" data-${k}="">すべて</button>${arr.map((c) => `<button class="chip ${cur === c ? 'on' : ''}" data-${k}="${esc(c)}">${esc(c)}</button>`).join('')}</div>`;
-  v.innerHTML = `<input id="q" type="search" placeholder="さがす" value="${esc(q)}">${chips(CATS, cat, 'cat')}${chips(LOCS, loc, 'loc')}` +
+  v.innerHTML = `<div class="row"><input id="q" type="search" placeholder="さがす" value="${esc(q)}"><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>${chips(CATS, cat, 'cat')}${chips(LOCS, loc, 'loc')}` +
     (list.length ? list.map((i) => `<div class="card item row ${isLow(i) ? 'low' : ''}" data-id="${i.id}">
       <div class="grow" data-edit><div class="nm">${esc(i.name)}</div><div class="sub">${esc(i.location || '')} ${esc(i.category || '')}${isLow(i) ? ' ・ 残りわずか' : ''}${i.expiry ? ' ・ 期限 ' + esc(i.expiry) : ''}</div></div>
       <button class="b" data-d="-1">−</button><div class="qty">${i.qty}</div><button class="b" data-d="1">＋</button></div>`).join('')
@@ -52,16 +55,17 @@ function renderStock(v) {
   v.querySelectorAll('.item').forEach((el) => {
     const it = items.find((x) => x.id === el.dataset.id);
     el.querySelector('[data-edit]').onclick = () => editDialog(it);
-    el.querySelectorAll('[data-d]').forEach((b) => (b.onclick = () => store.save({ ...it, qty: Math.max(0, it.qty + +b.dataset.d) })));
+    el.querySelectorAll('[data-d]').forEach((b) => (b.onclick = () => save({ ...it, qty: Math.max(0, it.qty + +b.dataset.d) })));
   });
   $('#add').onclick = () => editDialog();
+  $('#scan').onclick = barcodeAdd;
 }
 
 function renderShop(v) {
   const list = items.filter(isLow);
   v.innerHTML = list.length ? `<p class="sub">残りが「最低在庫」以下のものが自動で並びます。</p>` + list.map((i) => `<div class="card row"><div class="grow"><div class="nm">${esc(i.name)}</div><div class="sub">残り ${i.qty}(最低 ${i.minQty})</div></div><button class="b p" data-id="${i.id}">買った +${i.buyQty || 1}</button></div>`).join('')
     : `<div class="empty">買い足すものはありません 🎉<br><span class="sub">在庫の編集で「最低在庫」を設定すると、ここに出ます</span></div>`;
-  v.querySelectorAll('[data-id]').forEach((b) => (b.onclick = () => { const i = items.find((x) => x.id === b.dataset.id); store.save({ ...i, qty: i.qty + (i.buyQty || 1), boughtAt: new Date().toISOString().slice(0, 10) }); }));
+  v.querySelectorAll('[data-id]').forEach((b) => (b.onclick = () => { const i = items.find((x) => x.id === b.dataset.id); save({ ...i, qty: i.qty + (i.buyQty || 1), boughtAt: new Date().toISOString().slice(0, 10) }); }));
 }
 
 function renderFamily(v) {
@@ -72,11 +76,13 @@ function renderFamily(v) {
 }
 
 function renderImport(v) {
-  v.innerHTML = `<div class="card"><h3>📷 レシート写真</h3><p class="sub">端末内で文字認識します(画像は送信されません)。結果は確認してから登録します。</p><input type="file" id="rc" accept="image/*" multiple><div class="sub" id="rcs"></div></div>
+  v.innerHTML = `<div class="card"><h3>▮▮ バーコードで追加</h3><p class="sub">商品のバーコードをカメラで読むだけで追加できます。一度登録した商品は、次から数量が増えます。家族にも共有されます。</p><button class="b p" id="bc">バーコードを読む</button></div>
+  <div class="card"><h3>📷 レシート写真</h3><p class="sub">端末内で文字認識します(画像は送信されません)。結果は確認してから登録します。</p><input type="file" id="rc" accept="image/*" multiple><div class="sub" id="rcs"></div></div>
   ${gmailAvailable ? `<div class="card"><h3>✉️ Gmailの注文メール</h3><p class="sub">Amazon・楽天の注文確認メールを読み取ります(読み取り専用)。</p>
   <div class="grid2"><select id="gk"><option value="amazon">Amazon</option><option value="rakuten">楽天市場</option></select><select id="gm"><option value="1">過去1か月</option><option value="3" selected>過去3か月</option><option value="12">過去1年</option></select></div>
   <button class="b p" id="gb" style="margin-top:8px">読み取る</button><div class="sub" id="gs"></div></div>` : ''}
   <div class="card"><h3>📋 テキスト貼り付け</h3><p class="sub">注文履歴ページや購入メールの本文をそのまま貼り付けます。</p><textarea id="tx" rows="4"></textarea><button class="b" id="tb" style="margin-top:8px">解析する</button></div>`;
+  $('#bc').onclick = barcodeAdd;
   $('#rc').onchange = async (e) => {
     const fs = [...e.target.files]; if (!fs.length) return;
     const s = $('#rcs'); resetReview();
@@ -174,20 +180,57 @@ function reviewDialog() {
     } catch (err) { s.textContent = err.message; }
   });
   $('#cx').onclick = () => d.close();
-  $('#ok').onclick = async () => {
+  $('#ok').onclick = () => {
     const byName = new Map(items.map((i) => [norm(i.name), i]));
     let n = 0;
     for (const c of draft.filter((x) => x.on && x.name.trim())) {
       const ex = byName.get(norm(c.name));
       const keys = c.srcKey ? [c.srcKey] : [];
-      const rec = ex ? { ...ex, qty: ex.qty + c.qty, category: ex.category || c.category || '', boughtAt: c.boughtAt || ex.boughtAt, srcKeys: [...(ex.srcKeys || []), ...keys] }
-        : { name: c.name.trim(), qty: c.qty, category: c.category || '', location: '', minQty: 0, buyQty: 1, price: c.price, boughtAt: c.boughtAt, source: c.source, srcKeys: keys };
-      await store.save(rec); if (!ex) byName.set(norm(c.name), rec); n++;
+      const rec = ex ? { ...ex, qty: ex.qty + c.qty, category: ex.category || c.category || '', boughtAt: c.boughtAt || ex.boughtAt || '', srcKeys: [...(ex.srcKeys || []), ...keys] }
+        : { name: c.name.trim(), qty: c.qty, category: c.category || '', location: '', minQty: 0, buyQty: 1, price: c.price || 0, boughtAt: c.boughtAt || '', source: c.source, srcKeys: keys };
+      save(rec).catch(() => {}); byName.set(norm(c.name), rec); n++; // 送信は待たず、失敗は toast で知らせる
     }
     d.close(); toast(`${n}件を登録しました`); tab = 'stock'; render();
   };
   if (!d.open) d.showModal();
   d.scrollTop = st;
+}
+
+// ---------- バーコード追加 ----------
+async function barcodeAdd() {
+  const d = $('#dlg'); if (!d.open) d.showModal();
+  for (;;) {
+    const code = await scan(d); if (!code) return d.close();
+    if (!(await barcodeForm(d, code))) return d.close(); // false=終了 / true=続けて読む
+  }
+}
+
+// 読み取った番号の登録フォーム。登録済みなら数量を足す。戻り値: 続けるか
+function barcodeForm(d, code) {
+  return new Promise((resolve) => {
+    const ex = items.find((i) => i.barcode === code);
+    const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
+    d.innerHTML = `<h3>${ex ? '登録済みの商品' : '新しい商品'}</h3><div class="sub">バーコード ${esc(code)}</div>
+    <label>名前</label><input id="b-n" value="${esc(ex?.name || '')}" placeholder="${ex ? '' : '商品名を検索中…'}">
+    <div class="grid2"><div><label>${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" min="1" value="1"></div>
+    <div><label>カテゴリ</label><select id="b-c">${opts(CATS, ex?.category)}</select></div></div>
+    <div class="row" style="margin-top:12px"><button class="b" id="bx">終了</button><button class="b p grow" id="bok">${ex ? '数量を追加して次へ' : '登録して次へ'}</button></div>`;
+    const n = d.querySelector('#b-n'), c = d.querySelector('#b-c'); let typed = false;
+    n.oninput = () => (typed = true);
+    if (!ex) lookupName(code).then((name) => {
+      if (!typed && name) { n.value = name; if (!c.value) c.value = guessCategory(name) || ''; }
+      else if (!name) n.placeholder = '商品名を入力(見つかりませんでした)';
+    });
+    d.querySelector('#bx').onclick = () => resolve(false);
+    d.querySelector('#bok').onclick = () => {
+      const name = n.value.trim(); if (!name) return toast('名前を入れてください');
+      const add = Math.max(1, +d.querySelector('#b-q').value || 1);
+      const same = ex || items.find((i) => norm(i.name) === norm(name));
+      save(same ? { ...same, qty: same.qty + add, barcode: code, category: same.category || c.value }
+        : { name, qty: add, category: c.value, location: '', minQty: 0, buyQty: 1, barcode: code, source: 'barcode' }).catch(() => {});
+      toast(`${name} を追加しました`); resolve(true);
+    };
+  });
 }
 
 // ---------- 編集 ----------
@@ -204,7 +247,7 @@ function editDialog(it, memo) {
   $('#del')?.addEventListener('click', async () => { if (confirm('削除しますか?')) { await store.remove(it.id); d.close(); } });
   $('#ok').onclick = async () => {
     const name = $('#f-n').value.trim(); if (!name) return toast('名前を入れてください');
-    await store.save({ ...x, name, qty: +$('#f-q').value || 0, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: $('#f-c').value, location: $('#f-l').value });
+    await save({ ...x, name, qty: +$('#f-q').value || 0, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: $('#f-c').value, location: $('#f-l').value });
     d.close();
   };
   d.showModal();
@@ -216,7 +259,11 @@ document.querySelectorAll('#tabs button').forEach((b) => (b.onclick = () => { ta
   store = await createStore();
   await store.init((s) => {
     state = s; unsub?.(); unsub = null;
-    if (s.household) unsub = store.subscribe((a) => { items = a; render(); });
+    if (s.household) unsub = store.subscribe((a, m) => {
+      syncMsg = m?.pending ? ' ・ 同期中…' : '';
+      const sig = JSON.stringify(a);
+      if (sig !== lastSig) { lastSig = sig; items = a; render(); } else $('#who').textContent = `${state.household.name} / ${state.user.name}${syncMsg}`;
+    }, (e) => { syncMsg = ' ・ ⚠同期エラー'; toast(`同期できません: ${e.code || e.message}`); render(); });
     render();
   });
 })().catch((e) => { $('#view').innerHTML = `<div class="empty">起動に失敗: ${esc(e.message)}</div>`; });

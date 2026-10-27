@@ -67,12 +67,17 @@ async function cloudStore() {
       await fs.setDoc(fs.doc(db, 'users', user.uid), { hid: id });
       await emit();
     },
-    subscribe(cb) {
-      return fs.onSnapshot(items(), (s) => cb(s.docs.map((d) => ({ ...d.data(), id: d.id }))));
+    // cb(品目一覧, {pending: 送信待ちあり}) / 失敗時は onErr(エラー)
+    subscribe(cb, onErr) {
+      return fs.onSnapshot(items(), { includeMetadataChanges: true },
+        (s) => cb(s.docs.map((d) => ({ ...d.data(), id: d.id })), { pending: s.metadata.hasPendingWrites }),
+        (e) => onErr?.(e));
     },
     async save(item) {
       const id = item.id || uid();
-      await fs.setDoc(fs.doc(items(), id), { ...item, id, updatedAt: Date.now(), updatedBy: user.displayName || user.email });
+      // Firestore は undefined を含む保存を拒否するので取り除く
+      const rec = JSON.parse(JSON.stringify({ ...item, id, updatedAt: Date.now(), updatedBy: user.displayName || user.email }));
+      await fs.setDoc(fs.doc(items(), id), rec);
     },
     async remove(id) { await fs.deleteDoc(fs.doc(items(), id)); },
   };
