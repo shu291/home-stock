@@ -1,6 +1,6 @@
 import { createStore } from './store.js';
 import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
-import { ocr } from './ocr.js';
+import { ocr, warmupOcr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
 import { scan, lookupName } from './barcode.js';
 import { plan, daysLeft, expiryDays, withLog, autoClassify, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
@@ -284,12 +284,22 @@ function renderFamily(v) {
 function renderImport(v) {
   v.innerHTML = `<h2>まとめて追加</h2><div class="card"><h3>バーコードで追加</h3><p class="sub">商品のバーコードをカメラで読むだけで追加できます。一度登録した商品は、次から数量が増えます。家族にも共有されます。</p><button class="b p" id="bc">バーコードを読む</button></div>
   <div class="card"><h3>レシートを撮って追加</h3><p class="sub">端末の中で文字を読み取ります(画像は送信されません)。読み間違いは、写真を見ながら直してから登録します。</p>
-  <ul class="tips"><li>明るい場所で撮る</li><li>レシートを平らにして、真上から撮る</li><li>自分の影が入らないようにする</li></ul>
+  <div class="sub" id="mdl"></div><ul class="tips"><li>明るい場所で撮る</li><li>レシートを平らにして、真上から撮る</li><li>自分の影が入らないようにする</li></ul>
   <div class="row"><label class="b p filebtn grow">カメラで撮る<input type="file" id="rcc" accept="image/*" capture="environment" class="vh"></label><label class="b filebtn grow">アルバムから選ぶ<input type="file" id="rc" accept="image/*" multiple class="vh"></label></div><div id="rcs"></div></div>
   ${gmailAvailable ? `<div class="card"><h3>Gmailの注文メールから追加</h3><p class="sub">Amazon・楽天の注文確認メールを読み取ります(読み取り専用)。</p>
   <div class="grid2"><select id="gk" aria-label="お店"><option value="amazon">Amazon</option><option value="rakuten">楽天市場</option></select><select id="gm" aria-label="期間"><option value="1">過去1か月</option><option value="3" selected>過去3か月</option><option value="12">過去1年</option></select></div>
   <button class="b p" id="gb" style="margin-top:8px">読み取る</button><div class="sub" id="gs" role="status"></div></div>` : ''}
   <div class="card"><h3>注文メールの文章から追加</h3><p class="sub">注文履歴ページや購入メールの本文をそのまま貼り付けます。</p><textarea id="tx" rows="4" aria-label="貼り付ける文章"></textarea><button class="b" id="tb" style="margin-top:8px">読み取る</button></div>`;
+  const mdl = $('#mdl');
+  if (!ocrReady()) {
+    mdl.innerHTML = '初回だけ、読み取り用のデータ(約34MB)をダウンロードします。Wi-Fiでの利用をおすすめします。<br><button type="button" class="b" id="mdlb">いま準備する</button>';
+    $('#mdlb').onclick = async () => {
+      const b = $('#mdlb'); b.disabled = true; b.textContent = '準備中…';
+      const ok = await warmupOcr((p) => { b.textContent = `準備中 ${Math.round(p * 100)}%`; });
+      if (ok) { setOcrReady(); mdl.textContent = '準備できました。次から早く読み取れます。'; }
+      else mdl.textContent = '準備できませんでした。そのまま撮影しても、別の方式で読み取れます。';
+    };
+  }
   $('#bc').onclick = barcodeAdd;
   const pick = (e) => { const fs = [...e.target.files]; e.target.value = ''; return startPhotos(fs, $('#rcs')); };
   $('#rc').onchange = pick; $('#rcc').onchange = pick;
@@ -305,7 +315,9 @@ function renderImport(v) {
 // ---------- 取り込み確認 ----------
 let reviewGen = 0, reading = false, readCancel = null, readBox = null; // reviewGen: 確認が閉じられた/やり直された後の遅れた結果を捨てるための世代
 let ph = { open: null, sel: 0, zoom: 220 }; // 写真パネル(open: null=自動 / zoom: 写真の表示幅 %)
-const READ_LIMIT = 60e3, SLOW_MS = 10e3;
+const READ_LIMIT = 60e3, READ_LIMIT_FIRST = 300e3, SLOW_MS = 10e3; // 初回は読み取り用データ(約34MB)のダウンロード分だけ長く待つ
+const ocrReady = () => { try { return localStorage.getItem('hs-ocr-ready') === '1'; } catch { return false; } };
+const setOcrReady = () => { try { localStorage.setItem('hs-ocr-ready', '1'); } catch { /* 保存できなくても動く */ } };
 const FAIL_NOTE = 'うまく読み取れませんでした。写真を見ながら入力できます';
 // 写真は端末内のメモリ(ObjectURL)だけで持つ。保存も送信もしない。確認を閉じる/やり直すときに必ず手放す
 const resetReview = () => { receipts.forEach((r) => r.photo && URL.revokeObjectURL(r.photo)); draft = []; receipts = []; ph = { open: null, sel: 0, zoom: 220 }; reviewGen++; };
@@ -348,16 +360,16 @@ const blankRow = (rid) => ({ name: '', qty: 1, price: 0, boughtAt: receipts[rid]
 async function readPhotos(files, box) {
   reading = true; readBox = box;
   const gen = reviewGen; // 読み取り中に確認が閉じられたら、以降は何も足さない
-  let cancelled = false, cur = 0, pct = 0, t0 = Date.now(), wake;
+  let cancelled = false, cur = 0, pct = 0, t0 = Date.now(), wake, ac = null;
   const cancelP = new Promise((r) => (wake = r));
-  readCancel = () => { cancelled = true; wake(null); };
+  readCancel = () => { cancelled = true; ac?.abort(); wake(null); }; // 「やめる」で裏のOCRも止める
   box.innerHTML = '<div class="rdg"><div><span class="rd-m"></span> <span class="rd-t" aria-hidden="true"></span></div><div class="rd-w sub" role="status"></div><button type="button" class="b d" data-cancel>やめる(写真を見ながら入力)</button></div>';
   const m = box.querySelector('.rd-m'), tt = box.querySelector('.rd-t'), w = box.querySelector('.rd-w');
   const put = (e, s) => { if (e.textContent !== s) e.textContent = s; };
   const paint = () => {
     const s = Math.floor((Date.now() - t0) / 1000);
     put(m, `${files.length > 1 ? `${cur + 1}/${files.length}枚目 ` : ''}読み取り中…`); put(tt, `${pct}% ・ ${s}秒`);
-    put(w, Date.now() - t0 >= SLOW_MS ? 'しばらくかかります。待たずに「やめる」を押して、写真を見ながら入力することもできます' : pct === 0 ? '(初回は言語データの読み込みで時間がかかります)' : '');
+    put(w, Date.now() - t0 >= SLOW_MS ? 'しばらくかかります。待たずに「やめる」を押して、写真を見ながら入力することもできます' : pct === 0 && !ocrReady() ? '(初回は読み取り用のデータ約34MBをダウンロードします。Wi-Fiでの利用をおすすめします)' : '');
   };
   box.querySelector('[data-cancel]').onclick = () => readCancel?.();
   const timer = setInterval(paint, 500);
@@ -370,9 +382,10 @@ async function readPhotos(files, box) {
         cur = i; pct = 0; t0 = Date.now(); paint();
         let to;
         try {
-          const op = ocr(f, (p) => { if (cur === i) pct = Math.round(p * 100); });
-          op.catch(() => {});
-          text = (await Promise.race([op, cancelP, new Promise((_, rj) => (to = setTimeout(() => rj(new Error('timeout')), READ_LIMIT)))])) || '';
+          ac = new AbortController();
+          const op = ocr(f, (p) => { if (cur === i) pct = Math.round(p * 100); }, { signal: ac.signal });
+          op.then(setOcrReady, () => {});
+          text = (await Promise.race([op, cancelP, new Promise((_, rj) => (to = setTimeout(() => rj(new Error('timeout')), ocrReady() ? READ_LIMIT : READ_LIMIT_FIRST)))])) || '';
         } catch { text = ''; } finally { clearTimeout(to); }
       }
       if (gen !== reviewGen) break;

@@ -2,6 +2,9 @@
 import assert from 'node:assert/strict';
 import { parseReceipt, parseReceiptMeta, checkTotal, findDate, parseOrderMail } from './parse.js';
 import { guessCategory } from './category.js';
+import { fixName } from './ocr-post.js';
+import { correctText, setVocabulary } from './ocr-vocab.js';
+import { toLines, pick, dropNoise, textTilt } from './ocr-paddle.js';
 
 let pass = 0, fail = 0;
 const t = (name, fn) => { try { fn(); pass++; } catch (e) { fail++; console.log(`NG  ${name}\n    ${e.message.split('\n').join('\n    ')}`); } };
@@ -310,6 +313,88 @@ TEL 04-258- 1888
 t('OCR崩れ: 合計より後ろ(ポイント・広告)の行は品目にしない', () => {
   const x = 'ストア\nパン  ¥200\n合計  ¥200\nポイント対象金額  ¥200\nお得な クーポン配信中 300\n';
   assert.deepEqual(brief(parseReceipt(x)), ['パン|1|200']);
+});
+
+// ---- 深層学習OCR向けの補正(架空の店名・品名・金額だけで確かめる) ----
+t('OCR: 先頭の商品コード・「(TO)」を品名から外し、軽減税率マークが「怪」に化けた金額も読む', () => {
+  const x = `サンプル食堂 テスト店
+C1234 サンプルバーガー ¥300
+04567(TO)テストサラダ * ¥400
+テスト飲料 120怪
+合計 ¥820`;
+  assert.deepEqual(brief(parseReceipt(x)), ['サンプルバーガー|1|300', 'テストサラダ|1|400', 'テスト飲料|1|120']);
+});
+t('OCR: 合計が小さく読めたときでも、3桁以下の品目の金額を100で割らない', () => {
+  const x = 'ストア\nテスト牛乳 ¥198\nテスト卵 ¥258\n小計 ¥456\n合計 ¥45\n';
+  assert.deepEqual(brief(parseReceipt(x)), ['テスト牛乳|1|198', 'テスト卵|1|258']);
+});
+t('合計: 「税合計」「お預り合計」「合計残高」や、合計の後ろの行で上書きしない', () => {
+  const x = 'ストア テスト\nテストA ¥500\nテストB ¥300\n小計 ¥800\n税合計 ¥72\n合計 ¥800\nお預り合計 ¥1,000\nお客様の合計残高 29\n';
+  assert.equal(parseReceiptMeta(x).total, 800);
+  assert.deepEqual(brief(parseReceipt(x)), ['テストA|1|500', 'テストB|1|300']);
+});
+t('日付: 先に電話番号(0564-59-0770)のような日付でない並びがあっても、あとの日付を拾う', () => {
+  assert.equal(findDate('電話：0564-59-0770\n登録番号：T6180302002596\n2026年9月20日（日）14:29\n'), '2026-09-20');
+  assert.equal(findDate('TEL 055-236-6606\n2026年08月04日(火)16:04'), '2026-08-04');
+});
+t('OCR: 数量の「2コ」の「コ」が数字に化けた「23 × 単55 ¥110」は、金額と合う数量(2)に直す', () => {
+  const x = 'ストア テスト\nテスト飲料\n23 × 単55 ¥110\nテスト牛乳\n43 × 単298 ¥1,192\n合計 ¥1,302\n';
+  assert.deepEqual(brief(parseReceipt(x)), ['テスト飲料|2|110', 'テスト牛乳|4|1192']);
+});
+t('OCR後処理: 簡体字を日本の字体へ(単価・税抜・消費税・領収書・値引)', () => {
+  assert.equal(fixName('单价 税拔 消费税 領收书 值引'), '単価 税抜 消費税 領収書 値引');
+});
+t('OCR後処理: 半角カナの濁点・半濁点が別の記号になったものを戻す', () => {
+  assert.equal(fixName('テスト`'), 'テスド');
+  assert.equal(fixName('サンフ°ル'), 'サンプル');
+  assert.equal(fixName('ヘ゜ン'), 'ペン');
+  assert.equal(fixName('プ°'), 'プ');
+});
+t('OCR後処理: 長音が「一」「-」になったものと、カナに似た字を戻す(数字や漢字の「一」は触らない)', () => {
+  assert.equal(fixName('サンプル一'), 'サンプルー');
+  assert.equal(fixName('テスト一メン'), 'テストーメン');
+  assert.equal(fixName('コ-ンスープ'), 'コーンスープ');
+  assert.equal(fixName('ラ1ス'), 'ライス');
+  assert.equal(fixName('サ二ブル'), 'サニブル');
+  assert.equal(fixName('1〇〇〇円'), '1000円');
+  assert.equal(fixName('一個 二個 1個'), '一個 二個 1個');
+  assert.equal(fixName('合言十 ¥100'), '合計 ¥100');
+});
+t('語彙補正: 濁点が落ちた/似た字に化けた語を直し、正しい語・語彙にない語はそのまま', () => {
+  assert.equal(correctText('ミニアマト'), 'ミニトマト');
+  assert.equal(correctText('なめご'), 'なめこ');
+  assert.equal(correctText('ミニトマト'), 'ミニトマト');
+  assert.equal(correctText('サンプルバーガー'), 'サンプルバーガー'); // 語彙にない語
+  assert.equal(correctText('ダースプレミアム'), 'ダースプレミアム'); // 短い語(スープ)が長いカナの途中に埋まっていても直さない
+  assert.equal(correctText('おてんとさん'), 'おてんとさん');
+  assert.equal(correctText('ハンバーク定食 ¥500'), 'ハンバーグ定食 ¥500');
+});
+t('語彙補正: アプリ側の語彙(過去の品名)も使える', () => {
+  assert.equal(correctText('ウチノマミムメト'), 'ウチノマミムメト');
+  setVocabulary(['ウチノマミムメモ']);
+  assert.equal(correctText('ウチノマミムメト'), 'ウチノマミムメモ');
+  setVocabulary([]);
+});
+t('OCR行まとめ: 同じ高さの枠は1行に、右端の金額が少しずれて別の行になっても品名の行に付ける', () => {
+  const box = (text, x0, y0, x1, y1) => ({ text, x0: x0 - 5, y0: y0 - 5, x1: x1 + 5, y1: y1 + 5, conf: 1, t: { x0, y0, x1, y1 } });
+  const items = [box('品名A', 100, 100, 400, 140), box('¥300', 900, 96, 1000, 134), box('品名B', 100, 190, 400, 230), box('¥150', 900, 192, 1000, 232), box('品名C', 100, 280, 400, 320), box('¥200', 900, 260, 1000, 298)];
+  assert.deepEqual(toLines(items).map((l) => l.text), ['品名A ¥300', '品名B ¥150', '品名C ¥200']);
+  assert.deepEqual(toLines(items.slice(0, 4)).map((l) => l.text), ['品名A ¥300', '品名B ¥150']);
+});
+t('OCRのゴミ除去: ほかの枠もある行で、確信度が0.5未満の短い枠(模様を文字と読んだもの)だけ落とす', () => {
+  const p = (text, conf) => ({ text, conf });
+  assert.deepEqual(dropNoise([p('品名', 0.95), p('SARNAD', 0.44), p('品名B', 0.99)]).map((x) => x.text), ['品名', '品名B']);
+  assert.deepEqual(dropNoise([p('SARNAD', 0.44)]).map((x) => x.text), ['SARNAD']); // 1つだけの行は残す
+  assert.deepEqual(dropNoise([p('薄いが長い文字列です', 0.45), p('¥100', 0.9)]).map((x) => x.text), ['薄いが長い文字列です', '¥100']); // 長いものは残す
+});
+t('文字行の傾き: 細長い枠の向きの中央値(枠が少なければ0)', () => {
+  const b = (ang) => ({ ang, score: 0.9 });
+  assert.equal(textTilt([b(0.02), b(0.03), b(0.025), b(0.4), b(0.021), b(0.024), b(0.5), b(null)]), 0.024); // 0.35rad超とnullは数えない
+  assert.equal(textTilt([b(0.1), b(0.1)]), 0);
+});
+t('OCR候補の選択: 確信度が最大のものを選ぶ', () => {
+  assert.equal(pick([{ text: 'a', conf: 0.7 }, { text: 'b', conf: 0.95 }, { text: 'c', conf: 0.8 }], 'conf').text, 'b');
+  assert.equal(pick([{ text: 'あいう', conf: 0.9 }, { text: 'あいう', conf: 0.8 }, { text: 'xyz', conf: 0.95 }], 'medoid').text, 'あいう');
 });
 
 console.log(`${pass} passed, ${fail} failed`);

@@ -14,7 +14,7 @@ const SKIP = /合計|小計|総計|税|お預|預り|預かり|お釣|釣|おつ
 // 日付・時刻・電話番号・登録番号T+13桁など
 const NOISE = /\d{4}\s*[\/年.\-]\s*\d{1,2}\s*[\/月.\-]\s*\d{1,2}|\d{1,2}:\d{2}|令和|[RＲ]\d{1,2}[.\/]\d{1,2}[.\/]\d{1,2}|\d{2,4}-\d{2,4}-\d{3,4}|T\s?\d{13}|^No\.?\s*\d|^〒/;
 const TOTAL = /合計|総計|お会計|現計|お買上(?!点数)|ご請求|TOTAL/i;
-const NOT_TOTAL = /小計|点数|対象|ポイント|消費税|内税|外税|税額/;
+const NOT_TOTAL = /小計|点数|対象|ポイント|消費税|内税|外税|税額|税合計|残高|累計|預|釣/;
 const TAX = /外税|消費税|税額|税金/;
 const PAY = /クレジット|カード決済|PayPay|ペイ|コード決済|電子マネー|交通系|Suica|nanaco|WAON|QUICPay|楽天Edy|現金|お預|預り|預かり|お釣|おつり|釣/i;
 const DISC = /値引|割引|値下|クーポン|\d\s*%\s*(?:OFF|引)|\d割/i;
@@ -25,13 +25,11 @@ const NOT_STORE = /領収|レシート|いらっしゃい|ありがとう|ご利
 export function findDate(text) {
   const t = String(text ?? '').normalize('NFKC');
   const ymd = (y, m, d) => (y >= 2000 && y < 2100 && m >= 1 && m <= 12 && d >= 1 && d <= 31 ? `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}` : '');
-  // 「年」が % や記号に化けたもの・区切りの前の余計なカンマ(「2026,/08/27」)も許す
-  let m = t.match(/(\d{4})\s*,?\s*[\/年.\-%]\s*(\d{1,2})\s*[\/月.\-]\s*(\d{1,2})/);
-  if (m && ymd(+m[1], +m[2], +m[3])) return ymd(+m[1], +m[2], +m[3]);
-  m = t.match(/令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})/) || t.match(/[RＲ]\s*(\d{1,2})[.\/\-](\d{1,2})[.\/\-](\d{1,2})/);
+  // 「年」が % や記号に化けたもの・区切りの前の余計なカンマ(「2026,/08/27」)も許す。電話番号(0564-59-0770)など日付でない並びが先にあっても、最初の有効な日付を採る
+  for (const m of t.matchAll(/(\d{4})\s*,?\s*[\/年.\-%]\s*(\d{1,2})\s*[\/月.\-]\s*(\d{1,2})/g)) if (ymd(+m[1], +m[2], +m[3])) return ymd(+m[1], +m[2], +m[3]);
+  let m = t.match(/令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})/) || t.match(/[RＲ]\s*(\d{1,2})[.\/\-](\d{1,2})[.\/\-](\d{1,2})/);
   if (m && ymd(2018 + +m[1], +m[2], +m[3])) return ymd(2018 + +m[1], +m[2], +m[3]);
-  m = t.match(/(?:^|\D)(\d{2})[\/.\-](\d{1,2})[\/.\-](\d{1,2})\s*(?:\([月火水木金土日]\))?\s*\d{1,2}:\d{2}/);
-  if (m && ymd(2000 + +m[1], +m[2], +m[3])) return ymd(2000 + +m[1], +m[2], +m[3]);
+  for (const x of t.matchAll(/(?:^|\D)(\d{2})[\/.\-](\d{1,2})[\/.\-](\d{1,2})\s*(?:\([月火水木金土日]\))?\s*\d{1,2}:\d{2}/g)) if (ymd(2000 + +x[1], +x[2], +x[3])) return ymd(2000 + +x[1], +x[2], +x[3]);
   // 千の位が読めない「<026年 09月 22日」: 下2桁だけ使う
   m = t.match(/\D{1,2}0?(\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
   if (m && ymd(2000 + +m[1], +m[2], +m[3])) return ymd(2000 + +m[1], +m[2], +m[3]);
@@ -73,7 +71,7 @@ function cleanLine(raw) {
   s = s.replace(/(¥-?)([1-9]\d{0,2})\.(\d{3})(?!\d)/g, '$1$2,$3').replace(/(\s)([1-9]\d{0,2})\.(\d{3})\s*$/, '$1$2,$3'); // 「1.280」(カンマがピリオドに)
   s = s.replace(/(\d[\d,]*)\s*-\s*$/, '-$1'); // 「50-」
   s = s.replace(/\s[*※◆](?=¥?\d)/g, ' '); // 金額の前に付く軽減税率マーク「*1,020」
-  s = s.replace(/([\d,])\s*[(（]?[軽外内][)）]?\s*$/, '$1').replace(/([\d,])\s*[※*◆]+\s*$/, '$1'); // 軽減税率マーク(後置き)
+  s = s.replace(/([\d,])\s*[(（]?[軽外内怪経径輕]\)?[)）]?\s*$/, '$1').replace(/([\d,])\s*[※*◆]+\s*$/, '$1'); // 軽減税率マーク(後置き)
   s = s.replace(/(\d)\s+\d{1,2}%\s*$/, '$1').replace(/([\d,])\s*円\s*$/, '$1');
   s = s.replace(/(¥-?[\d,]+)\s*[^\s\d,.¥)）]{1,2}$/, '$1'); // 「¥630%」「¥198 電」(軽マークが記号や別の字に化ける)
   return s.replace(/\s+/g, ' ').trim();
@@ -93,6 +91,7 @@ function qtyLine(s) {
     else if (pb || ua) [qty, unit] = [A, B];
     else if (ub) [qty, unit] = [B, A];
     else [qty, unit] = [Math.min(A, B), Math.max(A, B)];
+    if (qty >= 10 && unit && T && qty * unit !== T && Math.floor(qty / 10) * unit === T) qty = Math.floor(qty / 10); // 「2コ」の「コ」が数字に化けた「23」: 金額と合う桁だけ取る
     if (qty < 1 || qty > 99) return null;
     return { qty, unit, total: T };
   }
@@ -105,8 +104,12 @@ function qtyLine(s) {
 }
 
 function cleanName(n) {
-  return n.replace(/^[※*◆●・\-\s]+/, '').replace(/^\d{8,14}\s*/, '').replace(/^0\d{1,2}\s+/, '')
-    .replace(/[¥|_]+/g, ' ').replace(/[\s.…・:]+$/, '').replace(/\s+/g, ' ').trim();
+  let t = n;
+  for (let i = 0; i < 3; i++) { // 先頭の商品コード・部門コード・「(TO)」(持ち帰り)を落とす
+    t = t.replace(/^[※*◆●・\-\s]+/, '').replace(/^\d{8,14}\s*/, '').replace(/^0\d{1,2}\s+/, '')
+      .replace(/^[A-Za-z]\s?\d{3,6}(?=\s|[^\d])\s*/, '').replace(/^0\d{3,5}(?=\s|[^\d])\s*/, '').replace(/^\d{4,6}\s+(?=\S)/, '').replace(/^[#＃]\d{2,4}[_＿*＊]?\s*/, '').replace(/^\d{2,3}\s?[*＊]\s*/, '').replace(/^[(（]\s*T[O0]\s*[)）]\s*/, '');
+  }
+  return t.replace(/[¥|_]+/g, ' ').replace(/[\s.…・:*※◆]+$/, '').replace(/\s+/g, ' ').trim();
 }
 const hasWord = (s) => /[ぁ-んァ-ヶ一-龠]/.test(s) || /[A-Za-z]{2}/.test(s); // 記号と1文字の英字だけ(「= =t」)は品名ではない
 
@@ -147,7 +150,7 @@ function analyze(text) {
     seq++;
     const p = pend && pend.seq === seq - 1 ? pend : null; pend = null;
     if (NOISE.test(s) || /^[(（]?\s*\d{1,2}\s*%\s*\S{0,6}\s*¥?[\d,]+\)?$/.test(s)) continue; // 日付・電話・「8%対象 ¥1,579」などの税率行
-    if (TOTAL.test(s) && !NOT_TOTAL.test(s)) { const a = lastNum(s); if (a) { meta.total = a; closed = true; } last = null; sub = true; continue; }
+    if (TOTAL.test(s) && !NOT_TOTAL.test(s)) { const a = lastNum(s); if (a && !closed) { meta.total = a; closed = true; } last = null; sub = true; continue; } // 最初の「合計」を採る(後ろの「お客様の合計残高」などで上書きしない)
     if (/小計|(?:^|\s)計\s*¥?\d/.test(s) && !/合計|総計/.test(s)) { const a = lastNum(s); if (a && !meta.total) subs.push(a); last = null; sub = true; continue; } // 「小計」の「小」が落ちた「計 ¥1,579」も
     if (sub && !meta.total && subs.length) { // 「合計」が化けた行(「=E ¥3,000」など): 文字がほぼ無く、金額が 小計(+税)と合うなら合計とみなす
       const jm = s.match(/^[^\dぁ-んァ-ヶ一-龠]{0,4}[A-Za-z=＝~ー\-]{0,3}\s*¥?\s*(\d[\d,]*)$/);
@@ -212,7 +215,7 @@ function repairAmounts(items, meta, subs) {
   // 品目の金額が小計/合計を超えることはない: 超えていたら、軽減税率マークが数字に化けた(下2桁が余分)とみて落とす
   const bound = Math.max(...subs, meta.total || 0);
   const mark = (it) => Object.defineProperty(it, 'repaired', { value: true, enumerable: false }); // 補正した行の印(保存データには出さない)
-  if (bound) for (const it of items) if (it.price > bound && it.qty === 1) { it.price = Math.floor(it.price / 100) || it.price; mark(it); }
+  if (bound) for (const it of items) if (it.price > bound && it.price >= 1000 && it.qty === 1) { it.price = Math.floor(it.price / 100) || it.price; mark(it); }
   const sum2 = items.reduce((a, i) => a + i.price, 0);
   if (targets.includes(sum2)) return;
   const sus = items.map((it, i) => ({ it, i })).filter(({ it }) => it.price >= 1000 && it.qty === 1).sort((a, b) => b.it.price - a.it.price).slice(0, 5); // 4桁以上で数量1の行だけが疑わしい(桁の多い順)

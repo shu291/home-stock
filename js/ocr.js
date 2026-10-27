@@ -1,8 +1,13 @@
 import { parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
+import { paddleDetect, textTilt, paddleRecognize, dropNoise, loadPaddle } from './ocr-paddle.js';
+import { fixName } from './ocr-post.js';
+import { correctText, setVocabulary } from './ocr-vocab.js';
+export { setVocabulary as setOcrVocabulary }; // 過去の品名などを渡すと、品名の補正に使う(省略可)
 
 let worker;
 const LONG_SIDE = 3000; // 紙の検出用に一旦このサイズへ収める(iPhoneの大きな写真でもメモリを食わない)
 const TARGET_W = 1400; // 紙を切り出したあと、紙の幅をこのサイズへ揃える(文字の大きさをOCRに適した大きさに)
+const PADDLE_W = 2000; // 深層学習OCRに渡す紙の幅(文字の高さが20〜40px程度になる大きさ)
 const MAX_PIXELS = 10e6; // 縦長レシートでも canvas がこの画素数を超えないようにする
 
 // JPEGのEXIF向き(1-8)と実ピクセル寸法(SOF)を先頭だけ読んで取る。読めなければ null
@@ -32,8 +37,8 @@ function loadImage(file) {
   });
 }
 
-// 画像 → OCR向けcanvas: EXIF向き補正 → 紙(レシート)の領域を検出して切り出し → 紙の幅を揃えて拡縮 → グレースケール → 局所しきい値の簡易二値化
-export async function preprocess(file, opt = {}) {
+// 画像を開く: EXIF向き補正済みの縮小画像(base: 紙の検出用)と、向き補正が要らなければ元画像(フル解像度)を保持する。使い終わったら close()
+export async function openImage(file) {
   const [img, ex] = await Promise.all([loadImage(file), readExif(file)]);
   const w = img.naturalWidth, h = img.naturalHeight;
   // 最近のブラウザは <img> をEXIFどおり自動で回転する。縦横入れ替わりの向き(5-8)で寸法が生のままなら、自分で回す
@@ -50,25 +55,67 @@ export async function preprocess(file, opt = {}) {
   else if (o === 7) bctx.transform(0, -1, -1, 0, cw, ch);
   else if (o === 8) bctx.transform(0, -1, 1, 0, 0, ch);
   bctx.drawImage(img, 0, 0, o >= 5 ? ch : cw, o >= 5 ? cw : ch);
-  img.src = '';
-  const r = findPaper(base); // {x,y,w,h}(base座標)。見つからなければ全体
-  const s = Math.min(3, (opt.width || TARGET_W) / r.w, Math.sqrt(MAX_PIXELS / (r.w * r.h)));
-  const ow = Math.max(1, Math.round(r.w * s)), oh = Math.max(1, Math.round(r.h * s));
+  // 紙の切り出しは、向き補正が要らない(o===1)なら元画像のフル解像度から行う(縮小済みのbaseから拡大するより文字が潰れない)
+  const fk = o === 1 ? w / cw : 0;
+  let paper = null;
+  return {
+    base, w: fk ? w : cw, h: fk ? h : ch, src: fk ? img : base,
+    paper() { return paper || (paper = findPaper(base)); }, // base座標
+    q: fk || 1, // base座標 → src座標
+    close() { base.width = base.height = 0; img.src = ''; if (paper?.outside) paper.outside.width = 0; },
+  };
+}
+
+// 回転した長方形の範囲 { cx, cy, w, h(src座標の中心と大きさ), rot(ラジアン。この角度だけ回して、文字行を水平にする) } を切り出す。
+// 出力は cv.meta = { s(拡大率), toSrc(u,v)(出力canvasの座標 → src座標), ...範囲 }。outside があれば(紙の外側を白く塗る canvas)範囲内に重ねる
+function cropOriented(im, o, width, outside) {
+  const { cx, cy, w, h, rot = 0 } = o, cos = Math.cos(rot), sin = Math.sin(rot);
+  const s = Math.min(3, (width || TARGET_W) / w, Math.sqrt(MAX_PIXELS / (w * h)));
+  const ow = Math.max(1, Math.round(w * s)), oh = Math.max(1, Math.round(h * s));
   const cv = document.createElement('canvas'); cv.width = ow; cv.height = oh;
   const ctx = cv.getContext('2d', { willReadFrequently: true });
   ctx.imageSmoothingQuality = 'high';
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, ow, oh);
-  ctx.drawImage(base, r.x, r.y, r.w, r.h, 0, 0, ow, oh);
-  if (r.outside) { ctx.drawImage(r.outside, 0, 0, ow, oh); r.outside.width = 0; } // 紙の外側(机など)は白く塗る
-  base.width = base.height = 0;
+  // src → 出力: 範囲の中心を原点に回し、s倍して出力の中心へ。範囲の4隅を含む外接矩形だけを描く
+  const hw = w / 2, hh = h / 2, xs = [], ys = [];
+  for (const [dx, dy] of [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]]) { xs.push(cx + dx * cos + dy * sin); ys.push(cy - dx * sin + dy * cos); }
+  const bx0 = Math.max(0, Math.floor(Math.min(...xs))), by0 = Math.max(0, Math.floor(Math.min(...ys))), bx1 = Math.min(im.w, Math.ceil(Math.max(...xs))), by1 = Math.min(im.h, Math.ceil(Math.max(...ys)));
+  ctx.save();
+  ctx.translate(ow / 2, oh / 2); ctx.rotate(rot); ctx.scale(s, s); ctx.translate(-cx, -cy);
+  if (bx1 > bx0 && by1 > by0) ctx.drawImage(im.src, bx0, by0, bx1 - bx0, by1 - by0, bx0, by0, bx1 - bx0, by1 - by0);
+  if (outside) ctx.drawImage(outside, cx - hw, cy - hh, w, h); // 紙の外側(机など)は白く塗る
+  ctx.restore();
+  cv.meta = { ...o, rot, s, toSrc(u, v) { const dx = (u - ow / 2) / s, dy = (v - oh / 2) / s; return [cx + dx * cos + dy * sin, cy - dx * sin + dy * cos]; } };
+  return cv;
+}
+
+// 紙(レシート)の領域を切り出して OCR向けの canvas にする。opt.orient({cx,cy,w,h,rot}: src座標)があれば紙の検出をせずその範囲を切り出す。
+// 既定は 二値化(局所しきい値)+傾き補正(二値画像の行の濃さから推定)済み。opt.gray: 二値化せず階調を残す。
+// opt.color: 色も残し、傾き補正はしない(文字検出の結果から求める方が確かなので、呼び出し側 locate() が回転した範囲を指定して切り直す)
+export function cropPaper(im, opt = {}) {
+  const { q } = im;
+  let rx0, ry0, rw, rh, outside = null;
+  if (opt.orient) { const o = opt.orient; return cropOriented(im, o, opt.width, null); }
+  const r = im.paper(); rx0 = r.x * q; ry0 = r.y * q; rw = r.w * q; rh = r.h * q; outside = r.outside;
+  rx0 = Math.max(0, Math.min(im.w - 1, rx0)); ry0 = Math.max(0, Math.min(im.h - 1, ry0));
+  rw = Math.max(1, Math.min(im.w - rx0, rw)); rh = Math.max(1, Math.min(im.h - ry0, rh));
+  const cv = cropOriented(im, { cx: rx0 + rw / 2, cy: ry0 + rh / 2, w: rw, h: rh, rot: 0 }, opt.width, outside);
+  if (opt.color) return cv;
+  const ow = cv.width, oh = cv.height, ctx = cv.getContext('2d', { willReadFrequently: true });
   enhance(ctx, ow, oh, !!opt.gray);
   const ang = estimateSkew(cv);
   if (!ang) return cv;
   const rt = document.createElement('canvas'); rt.width = ow; rt.height = oh; // 傾きを戻す(はみ出す所は白)
   const rx = rt.getContext('2d', { willReadFrequently: true });
   rx.fillStyle = '#fff'; rx.fillRect(0, 0, ow, oh); rx.translate(ow / 2, oh / 2); rx.rotate(ang); rx.drawImage(cv, -ow / 2, -oh / 2);
-  cv.width = cv.height = 0;
+  const meta = cv.meta; cv.width = cv.height = 0; rt.meta = meta;
   return rt;
+}
+
+// 画像 → OCR向けcanvas(従来どおりの1回呼び出し版)
+export async function preprocess(file, opt = {}) {
+  const im = await openImage(file);
+  try { return cropPaper(im, opt); } finally { im.close(); }
 }
 
 // 紙(レシート)の領域を探す: 縮小画像の「RGBの最小値」(白い紙は高く、色付きの机や影は低い)をぼかして大津の方法で二値化 →
@@ -230,8 +277,77 @@ async function getWorker(lang) {
   return worker;
 }
 
-// レシート画像 → テキスト(端末内で処理。画像は外部に送られない)
-export async function ocr(file, onProgress) {
+// 文字の枠の分布から、レシートの文字がある範囲を求める。枠の左右の端は多くの行が共有するので、両端の数%は外れ値として除く。
+// 戻り値 { x0, x1, y0, y1 }(切り出し画像の画素)。枠が少なければ null
+function textRange(boxes) {
+  const ok = boxes.filter((b) => b.score >= 0.6 && b.t.x1 - b.t.x0 >= 2 * (b.t.y1 - b.t.y0));
+  if (ok.length < 3) return null;
+  const pct = (a, p) => { a = a.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.max(0, Math.round(p * (a.length - 1))))]; };
+  const t = ok.length >= 12 ? 0.04 : 0;
+  return { x0: pct(ok.map((b) => b.t.x0), t), x1: pct(ok.map((b) => b.t.x1), 1 - t), y0: Math.min(...ok.map((b) => b.t.y0)), y1: Math.max(...ok.map((b) => b.t.y1)) };
+}
+
+// 写真全体(紙の検出はしない: 白い机・影・模様で外れることがあるため)から文字の位置を粗く検出し、文字のある範囲・傾きで切り出し直して検出し直す。
+// さらに切り出しの左右の端に文字が接していれば、広げてもう一度(最大2回)。
+// 戻り値 { cv(切り出した色付きcanvas。使い終わったら width=0 で解放), boxes }
+export async function locate(im, onProgress) {
+  const W = globalThis.OCR_PADDLE_CFG?.width || PADDLE_W, W0 = globalThis.OCR_PADDLE_CFG?.coarseW || 1600;
+  let cv = cropPaper(im, { color: true, width: W0, orient: { cx: im.w / 2, cy: im.h / 2, w: im.w, h: im.h, rot: 0 } });
+  let boxes = await paddleDetect(cv, (p) => onProgress?.(p), W0);
+  for (let round = 0; round < 3; round++) {
+    const tilt = textTilt(boxes), r = textRange(boxes);
+    if (!r) break;
+    const strong = boxes.filter((x) => x.score >= 0.6 && x.t.x1 - x.t.x0 >= 2 * (x.t.y1 - x.t.y0));
+    const first = round === 0, ww = r.x1 - r.x0;
+    const edge = !first && strong.filter((x) => x.t.x0 < 0.012 * cv.width || x.t.x1 > 0.988 * cv.width || x.t.y1 > 0.99 * cv.height).length >= 2;
+    const fits = !first && ww > 0.7 * cv.width; // 切り出しが文字に合っている(狭すぎも広すぎもしない)
+    if (!first && !edge && Math.abs(tilt) <= 0.014 && fits) break;
+    if (globalThis.OCR_PADDLE_CFG?.debug) console.log('locate', round, JSON.stringify({ cv: [cv.width, cv.height], tilt: +tilt.toFixed(4), r, edge, fits, n: boxes.length }));
+    const m = cv.meta, rot = m.rot - tilt, cos = Math.cos(rot), sin = Math.sin(rot);
+    // 文字の枠の四隅(src座標)を、新しい向きで見たときの外接矩形 → 範囲(rは第1回は元の向きの範囲なので、枠の四隅から求め直す)
+    const inR = strong.filter((x) => x.t.x0 >= r.x0 - 1 && x.t.x1 <= r.x1 + 1);
+    const pts = inR.flatMap((x) => [[x.t.x0, x.t.y0], [x.t.x1, x.t.y0], [x.t.x1, x.t.y1], [x.t.x0, x.t.y1]].map(([u, v]) => m.toSrc(u, v)));
+    const qx = pts.map(([x, y]) => (x - m.cx) * cos - (y - m.cy) * sin), qy = pts.map(([x, y]) => (x - m.cx) * sin + (y - m.cy) * cos);
+    let x0 = Math.min(...qx), x1 = Math.max(...qx), y0 = Math.min(...qy), y1 = Math.max(...qy);
+    const mx = (x1 - x0) * (edge ? 0.12 : 0.07), my = (y1 - y0) * 0.02; x0 -= mx; x1 += mx; y0 -= my; y1 += my;
+    const ccx = (x0 + x1) / 2, ccy = (y0 + y1) / 2; // 新しい向きでの中心 → src座標
+    const orient = { cx: m.cx + ccx * cos + ccy * sin, cy: m.cy - ccx * sin + ccy * cos, w: x1 - x0, h: y1 - y0, rot };
+    cv.width = cv.height = 0;
+    cv = cropPaper(im, { color: true, width: W, orient });
+    boxes = await paddleDetect(cv);
+    if (first) continue;
+  }
+  return { cv, boxes };
+}
+
+// 深層学習(PP-OCR系)で読む: 紙の切り出し → 文字の位置を検出 → 1かたまりずつ認識 → 行にまとめる → 後処理(字体の補正・語彙による補正)。
+// 戻り値: { text, lines: [{ text, conf(0〜1の認識確信度), x0, y0, x1, y1, parts: [{text, conf, x0, y0, x1, y1}] }], size: [幅, 高さ], ms: {locate, recognize}(所要ミリ秒。モデル読み込み込み) }
+// lines の座標は切り出し後の画像の画素。行ごとの確信度や位置が欲しいときに使う(ocr() はこの text だけを返す)
+export async function ocrDetailed(file, onProgress, signal) {
+  const stop = () => { if (signal?.aborted) throw new DOMException('読み取りを中断しました', 'AbortError'); };
+  const prog = (f) => (p) => { stop(); onProgress?.(f(p)); }; // 進捗の通知のたびに中断を確かめる(中断されたら例外で抜ける)
+  stop();
+  const im = await openImage(file);
+  let cv;
+  try {
+    const t0 = performance.now();
+    const loc = await locate(im, prog((p) => p * 0.3));
+    stop();
+    cv = loc.cv;
+    const t1 = performance.now();
+    onProgress?.(0.4);
+    if (globalThis.OCR_PADDLE_CFG?.debug) globalThis.__dbgPre = cv.toDataURL('image/jpeg', 0.85);
+    const res = await paddleRecognize(cv, loc.boxes, prog((p) => 0.4 + p * 0.6), fixName);
+    const lines = res.lines.map((l) => {
+      const parts = dropNoise(l.parts).map((q) => ({ text: correctText(q.text), conf: q.conf, x0: q.x0, y0: q.y0, x1: q.x1, y1: q.y1, t: q.t, ang: q.ang, cands: q.cands }));
+      return { text: parts.map((q) => q.text).join(' '), conf: l.conf, x0: l.x0, y0: l.y0, x1: l.x1, y1: l.y1, parts };
+    });
+    return { text: lines.map((l) => l.text).join('\n'), lines, size: [cv.width, cv.height], ms: { locate: Math.round(t1 - t0), recognize: Math.round(performance.now() - t1) } };
+  } finally { if (cv) cv.width = cv.height = 0; im.close(); }
+}
+
+// Tesseract.js(従来方式)。深層学習OCRが使えない端末(古いSafariなど)や、何も読めなかったときの代わり
+async function ocrTesseract(file, onProgress, signal) {
   if (!window.Tesseract) {
     await new Promise((res, rej) => {
       const s = document.createElement('script');
@@ -240,7 +356,9 @@ export async function ocr(file, onProgress) {
     });
   }
   let best = null;
+  signal?.addEventListener('abort', () => { const w = worker; worker = null; workerLang = ''; w?.terminate(); }, { once: true }); // 認識の途中でも Worker を閉じて止める
   for (let pass = 0; pass < PASSES.length; pass++) {
+    if (signal?.aborted) { const w = worker; worker = null; workerLang = ''; await w?.terminate(); throw new DOMException('読み取りを中断しました', 'AbortError'); }
     progressCb = (p) => onProgress?.((pass + p) / PASSES.length);
     const w = await getWorker(PASSES[pass].lang);
     let src = file;
@@ -254,4 +372,25 @@ export async function ocr(file, onProgress) {
   }
   onProgress?.(1);
   return best.text;
+}
+
+// 深層学習OCRのモデル(約33MB)を先に読み込んでおく。初回だけ時間がかかる(以降は端末内に保存済み)ので、
+// レシート画面を開いたときや、Wi-Fiにつながっている間に呼んでおくと、最初の1枚が待たされない。失敗しても例外は投げない(戻り値 false)
+export async function warmupOcr(onProgress) {
+  try { await loadPaddle(onProgress); return true; } catch { return false; }
+}
+
+// レシート画像 → テキスト(端末内で処理。画像は外部に送られない)。
+// まず深層学習OCR(初回だけモデル約33MBをダウンロード)で読み、使えない/何も取れないときだけ Tesseract.js で読む
+// opt.signal(AbortSignal)で中断できる: 中断されると AbortError の例外を投げる(Tesseract の Worker は閉じる)
+export async function ocr(file, onProgress, opt = {}) {
+  const signal = opt.signal;
+  if (!globalThis.OCR_PADDLE_OFF) {
+    try {
+      const r = await ocrDetailed(file, onProgress, signal);
+      const j = judge(r.text);
+      if (j[5] >= 1 || j[2]) { onProgress?.(1); return r.text; } // 品目か合計が取れた
+    } catch (e) { if (e?.name === 'AbortError') throw e; console.warn('深層学習OCRを使えませんでした。Tesseract.jsで読みます', e); }
+  }
+  return ocrTesseract(file, onProgress, signal);
 }
