@@ -141,18 +141,35 @@ async function openBD(code) {
   } catch { return ''; }
 }
 
-// 楽天の商品名は宣伝文句が長いので、【…】などを除いて短くする
-const tidy = (n) => n.replace(/【[^】]*】|［[^］]*］|\[[^\]]*\]|★[^★]*★|[☆★♪]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+// 楽天の商品名は宣伝文句が長いので、【…】・◆…◆・送料や特売の注記などを除いて短くする
+const tidy = (n) => n
+  .replace(/【[^】]*】|［[^］]*］|\[[^\]]*\]|◆[^◆]*◆|★[^★]*★|[☆★♪◆◇●○▼▲]/g, ' ')
+  .replace(/[（(][^）)]*(送料|限定|特売|※|P\d|ポイント|取寄|まとめ買い|あす楽|発送)[^）)]*[）)]/g, ' ')
+  .split(/※|\s\/\s|\/[a-z]{1,3}\/|(?:送料無料|あす楽|ポイント\d+倍)/)[0]
+  .replace(/[【［\[(（]\S*$/, ' ')            // 閉じていない括弧から後ろは捨てる
+  .replace(/\s+/g, ' ').trim()
+  .split(' ').filter((w, i, a) => w !== a[i - 1]).join(' ') // 同じ語の連続を1つに
+  .slice(0, 40);
 
+// 楽天市場の商品検索。番号(JAN)をキーワードにすると別の商品も混ざるので、商品名か説明に番号そのものが入っているものだけを採る。
+// 商品名はお店ごとにまちまち(ケース売りなど)なので、見つかっても確認画面で直せる前提。API仕様: webservice.rakuten.co.jp/documentation/ichiba-item-search
 async function rakuten(code) {
   const { applicationId, accessKey } = rakutenApi;
   if (!applicationId || !accessKey) return '';
   try {
-    const u = `https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20220601?applicationId=${applicationId}&accessKey=${accessKey}&format=json&hits=1&keyword=${code}`;
-    const r = await fetch(u, { signal: AbortSignal.timeout(5000) });
+    const u = `https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701?applicationId=${encodeURIComponent(applicationId)}&accessKey=${encodeURIComponent(accessKey)}&format=json&formatVersion=2&hits=10&keyword=${code}`;
+    const r = await fetch(u, { signal: AbortSignal.timeout(6000) });
     if (!r.ok) return '';
-    const it = (await r.json()).Items?.[0];
-    return tidy(it?.Item?.itemName ?? it?.itemName ?? '');
+    const j = await r.json();
+    // 応答の配列名は Items(大文字)。形式によっては各要素が Item で包まれるので、どちらでも読めるようにする
+    const items = (j.Items || j.items || []).map((x) => x.Item || x.item || x);
+    // 商品名に番号が入っているものを優先。ほかの番号も並べた商品(詰め合わせの出品)は後回しにし、同じなら短い名前を選ぶ
+    const janCount = (t) => new Set(t.match(/\d{13}/g) || []).size;
+    const best = (list) => list.sort((a, b) => janCount(String(a.itemName)) - janCount(String(b.itemName)) || String(a.itemName).length - String(b.itemName).length)[0];
+    const byName = items.filter((i) => String(i.itemName || '').includes(code));
+    const byCaption = items.filter((i) => `${i.catchcopy || ''}${i.itemCaption || ''}`.includes(code));
+    const hit = best(byName.filter((i) => janCount(String(i.itemName)) <= 1)) || best(byCaption.filter((i) => janCount(String(i.itemName)) <= 1));
+    return hit ? tidy(String(hit.itemName || '')) : '';
   } catch { return ''; }
 }
 

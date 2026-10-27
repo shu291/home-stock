@@ -10,4 +10,4 @@ export const firebaseConfig = {
 export const googleClientId = "";
 
 // 楽天ウェブサービス(商品名の検索用・任意)。空なら Open Food Facts だけで検索する。
-export const rakutenApi = { applicationId: "", accessKey: "" };
+export const rakutenApi = { applicationId: "874b8348-a98b-437b-a703-222bcebb8e6b", accessKey: "pk_lrndQCDJMBA5cc3FZk1TKfyZdvNbDgLipTPTNvWwk9X" };
