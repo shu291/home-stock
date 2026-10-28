@@ -2,7 +2,7 @@ import { createStore } from './store.js';
 import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
 import { ocr, warmupOcr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
-import { scan, lookupName } from './barcode.js';
+import { scan, lookupName, canonCode } from './barcode.js';
 import { CATS, LOCS, LEGACY_CATEGORY, canonCategory, canonLocation, catInfo, locInfo, categoryOptions, subOptions, locationOptions } from './taxonomy.js';
 import { guessClass } from './category.js';
 import { plan, daysLeft, expiryDays, withLog, autoClassify, EXPIRY_DAYS, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
@@ -220,8 +220,10 @@ function infoOf(i, now) {
   const cat = canonCategory(raw, LEGACY_CATEGORY[raw] ? guessClass(i.name).category : ''), loc = canonLocation(i.location, i.name);
   return { i, d, low, rank, near: d !== null && d <= EXPIRY_DAYS, cat, ci: catInfo(cat), loc, li: locInfo(loc), sub: String(i.sub ?? '').trim() };
 }
-const pillOf = (x) => (x.rank === 0 ? ['expired', '⛔', '期限切れ'] : x.rank === 1 ? ['zero', '✕', 'なくなった'] : x.rank === 2 ? ['low', '⚠', '残りわずか']
-  : x.rank === 3 ? ['soon', '⏰', x.d === 0 ? '今日まで' : `あと${x.d}日`] : x.i.qty <= 0 ? ['none', '', '在庫なし'] : null);
+// 予測・前回の期限は「(予測)」「(前回から)」を併記し、期限切れは実際の表示より控えめな文言にする
+const pillOf = (x) => { const est = estSrc(x.i.expirySrc), sfx = est ? `(${x.i.expirySrc === '前回' ? '前回から' : '予測'})` : '';
+  return x.rank === 0 ? (est ? ['expired est', '⛔', `期限の目安を過ぎています${sfx}`] : ['expired', '⛔', '期限切れ']) : x.rank === 1 ? ['zero', '✕', 'なくなった'] : x.rank === 2 ? ['low', '⚠', '残りわずか']
+  : x.rank === 3 ? ['soon', '⏰', (x.d === 0 ? '今日まで' : `あと${x.d}日`) + sfx] : x.i.qty <= 0 ? ['none', '', '在庫なし'] : null; };
 const SORT_CMP = (now) => {
   const nameCmp = (a, b) => a.i.name.localeCompare(b.i.name, 'ja');
   return {
@@ -422,9 +424,12 @@ const nm = (i) => `「${esc(i.name)}」`;
 // カードの一覧 {type, key, cls, title, body, ok:{label, fn}}。「あとで」済みは除く
 function aiCards() {
   const p = getPlan(), dm = dismissed(), cs = [];
-  for (const { item: i, days, expired } of p.expiring) cs.push({ type: 'exp', key: `exp:${i.id}:${i.expiry}`, cls: 'alert', title: `${nm(i)}の期限${expired ? 'が切れています' : 'が近づいています'}`,
-    body: `期限 ${dateJa(i.expiry)}(${expired ? `${-days}日前` : days === 0 ? '今日' : `あと${days}日`})・ 残り ${i.qty}個`,
-    ok: expired ? { label: '捨てた(数を0にする)', fn: () => saveQty(i, { ...i, qty: 0, expiry: '' }, { skip: true }) } : null, ok2: expired ? { label: 'まだ使える(期限を消す)', fn: () => save({ ...i, expiry: '' }) } : null, no: expired ? 'あとで' : '見ました' });
+  for (const { item: i, days, expired } of p.expiring) {
+    const est = estSrc(i.expirySrc), lab = i.expirySrc === '前回' ? '前回の期間からの目安' : '予測';
+    cs.push({ type: 'exp', key: `exp:${i.id}:${i.expiry}`, cls: 'alert', title: est ? `${nm(i)}の期限の目安${expired ? 'を過ぎています' : 'が近づいています'}(${lab})` : `${nm(i)}の期限${expired ? 'が切れています' : 'が近づいています'}`,
+      body: `${est ? '予測の期限' : '期限'} ${dateJa(i.expiry)}(${expired ? `${-days}日前` : days === 0 ? '今日' : `あと${days}日`})・ 残り ${i.qty}個${est ? '<br><span class="sub">標準的な期間からの目安です。パッケージの表示を確かめてください。</span>' : ''}`,
+      ok: expired ? { label: '捨てた(数を0にする)', fn: () => saveQty(i, { ...noExp(i), qty: 0 }, { skip: true }) } : null, ok2: expired ? { label: 'まだ使える(期限を消す)', fn: () => save(noExp(i)) } : null, no: expired ? 'あとで' : '見ました' });
+  }
   for (const { item: i, cur, sug, rate } of p.parSuggestions) cs.push({ type: 'par', key: `par:${i.id}:${sug.minQty}:${sug.buyQty}`, title: `${nm(i)}の買い方を見直しませんか`,
     body: `いま: ${cur.minQty}個以下になったら買い物リストに出す ・ 1回に${cur.buyQty}個買う<br>→ <b>${sug.minQty}個以下で出す ・ 1回に${sug.buyQty}個買う</b>にするとちょうどよさそうです。<br><span class="sub">1日に約${rate.toFixed(2)}個のペースで使っている計算です(約1週間分を切らさず、約2週間分ずつ買う目安)。</span>`,
     ok: { label: '変更する', fn: () => save({ ...i, minQty: sug.minQty, buyQty: sug.buyQty }) } });
@@ -499,6 +504,9 @@ function renderFamily(v) {
   v.innerHTML = `<h2 class="vh">家族と設定</h2><div class="card"><h3>${esc(h.name)}</h3>${cloud ? `<p class="sub">家族に下のリンクを送ってください。開いてログインすると、参加の画面にコードが自動で入ります。</p><div class="code" id="code">${esc(h.id)}</div>
     <div class="row" style="flex-wrap:wrap"><button class="b p" id="sh" style="flex:1 1 45%;white-space:normal">家族にリンクを送る</button><button class="b" id="cl" style="flex:1 1 45%;white-space:normal">リンクをコピー</button><button class="b" id="cp" style="flex:1 1 45%;white-space:normal">コードだけコピー</button></div>` : `<p class="sub">いまは、この携帯だけで使っています(家族とは共有されません)。家族で共有するには js/config.js に Firebase の設定が必要です(README参照)。</p>`}</div>
   <div class="card"><h3>データの書き出し</h3><p class="sub">いまの在庫(${items.length}件)を、表計算ソフトなどで開けるファイルに保存します。</p><div class="row"><button class="b grow" id="ex-csv">CSV</button><button class="b grow" id="ex-json">JSON</button></div></div>
+  <div class="card" id="xp"><h3>期限の予測</h3><label class="swl"><input type="checkbox" id="ae" ${autoExp() ? 'checked' : ''}><span>期限が書いていないとき、予測で自動入力する</span></label>
+  <p class="sub">予測は標準的な期間にもとづく目安です。パッケージの表示があれば必ずそちらを使ってください。この設定はこの端末だけのものです。</p>
+  <h4 class="xh">予測の的中率</h4><p id="xs" role="status"></p><p class="sub">予測・前回の期限を、実際の日付に直した品と、「合っていた」を押した品の結果です(この端末だけの記録)。目安を確かめるための記録で、精度を保証するものではありません。「長すぎた予測」は、予測が実際より長かった誤りです。</p><button class="b" id="xs-reset">記録をリセット</button></div>
   <div class="card"><h3>レシートの修正の学習</h3><p class="sub">レシートの読み間違いを直すと、この端末が覚えて、次から自動で直します(この端末の中だけに保存されます)。覚えた数: <span id="fxn">${fixLoad().length}</span>件</p><button class="b" id="fx-reset" ${fixLoad().length ? '' : 'disabled'}>修正の学習をリセット</button></div>
   ${cloud ? '<div class="danger"><button class="b" id="out">ログアウト</button></div>' : ''}`;
   const copy = (t, m) => (navigator.clipboard?.writeText(t) ?? Promise.reject()).then(() => toast(m), () => toast('コピーできませんでした。コードを長押しして選んでください'));
@@ -507,6 +515,10 @@ function renderFamily(v) {
   $('#cl')?.addEventListener('click', () => copy(link, 'リンクをコピーしました'));
   $('#sh')?.addEventListener('click', () => (navigator.share ? navigator.share({ title: 'うちの在庫', text: `「うちの在庫」に参加してください。開いてログインすると家族コード(${h.id})が入ります。`, url: link }).catch(() => {}) : copy(link, 'リンクをコピーしました。LINEなどに貼ってください')));
   $('#fx-reset').onclick = () => { const was = fixLoad(); fixSave([]); $('#fxn').textContent = '0'; $('#fx-reset').disabled = true; toast('修正の学習をリセットしました', () => { fixSave(was); renderFamily(v); }); };
+  const xsPaint = () => { const x = xsLoad(); $('#xs').innerHTML = x.n >= 5 ? `<b>${x.n}件中${x.hit}件(${Math.round((x.hit / x.n) * 100)}%)</b>。長すぎた予測: ${x.long}件` : `まだデータがたまっていません(あと${5 - x.n}件)`; $('#xs-reset').disabled = !x.n; };
+  xsPaint();
+  $('#ae').onchange = (e) => { lsSet('hs-autoexp', e.target.checked ? '1' : '0'); toast(e.target.checked ? '予測の自動入力をオンにしました' : '予測の自動入力をオフにしました'); };
+  $('#xs-reset').onclick = () => { const was = xsLoad(); xsSave({ n: 0, hit: 0, long: 0 }); xsPaint(); toast('的中率の記録をリセットしました', () => { xsSave(was); xsPaint(); }); };
   $('#ex-csv').onclick = () => exportData('csv'); $('#ex-json').onclick = () => exportData('json');
 }
 
@@ -638,7 +650,7 @@ async function startPhotos(files, box, inDlg) {
     await readPhotos(files, box);
     if (gen !== reviewGen) return; // 読み取り中に確認が閉じられた
     for (const c of draft) autoDraft(c);
-    reviewDialog();
+    reviewDialog(); autoExpDraft();
   } catch (err) { box.textContent = `うまくいきませんでした: ${err.message}`; }
 }
 
@@ -676,7 +688,7 @@ const autoDraft = (c) => {
 function openReview(raw) {
   for (const c of draft) autoDraft(c);
   if (!draft.length) { toast('品目を見つけられませんでした'); if (raw) editDialog(null, raw); return; }
-  reviewDialog();
+  reviewDialog(); autoExpDraft();
 }
 
 const yen = (n) => '¥' + Math.abs(n).toLocaleString('ja-JP');
@@ -692,10 +704,11 @@ function checkHtml(r, n) {
 }
 
 // 写真の全画面表示。1本指でなぞる・2本指で拡大・ダブルタップ・ボタンで拡大縮小
-function openViewer(url) {
+function openViewer(url, label = 'レシートの写真') {
   let v = $('#pv');
-  if (!v) { v = document.createElement('dialog'); v.id = 'pv'; v.setAttribute('aria-label', 'レシートの写真'); document.body.append(v); }
-  v.innerHTML = '<div class="pvs"><img alt="レシートの写真" draggable="false"></div><div class="pvh">指でなぞると動かせます。2本の指で拡大できます</div><div class="pvb"><button type="button" class="b" data-z="1">＋ 大きく</button><button type="button" class="b" data-z="-1">－ 小さく</button><button type="button" class="b" data-z="0">全体を見る</button><button type="button" class="b p" data-x autofocus>閉じる</button></div>';
+  if (!v) { v = document.createElement('dialog'); v.id = 'pv'; document.body.append(v); }
+  v.setAttribute('aria-label', label);
+  v.innerHTML = '<div class="pvs"><img alt="${esc(label)}" draggable="false"></div><div class="pvh">指でなぞると動かせます。2本の指で拡大できます</div><div class="pvb"><button type="button" class="b" data-z="1">＋ 大きく</button><button type="button" class="b" data-z="-1">－ 小さく</button><button type="button" class="b" data-z="0">全体を見る</button><button type="button" class="b p" data-x autofocus>閉じる</button></div>';
   const st = v.querySelector('.pvs'), im = st.firstChild, P = new Map();
   let s = 1, x = 0, y = 0, tap = 0, moved = 0;
   const W = () => st.clientWidth, H = () => st.clientHeight, IH = () => (im.naturalWidth ? im.naturalHeight / im.naturalWidth : 1) * W();
@@ -752,6 +765,30 @@ function rowEff(c) {
 }
 const rcText = (e) => `<span>場所・小分類:</span> <b>${e.location ? `${locInfo(e.location).icon} ${esc(e.location)}` : '置き場所なし'}</b>${e.locSrc === 'ctx' ? '(追加先)' : e.locSrc === 'auto' ? '(自動)' : ''} ・ <b>${e.sub ? esc(e.sub) : '小分類なし'}</b>`;
 
+// 取り込み確認の行の期限(c.expiry/expiryKind/expirySrc/expiryFrom。c.ue=手で触った)。折りたたみの中に置く
+const expSum = (c) => ` ・ <b>${c.expiry ? `期限 ${c.expirySrc === '予測' ? '予測 ' : ''}${dateJa(c.expiry)}` : '期限なし'}</b>`;
+function paintExp(n) {
+  const d = $('#dlg'), c = draft[n], card = d.dataset.kind === 'review' && c ? d.querySelector(`[data-row="${n}"]`) : null; if (!card) return;
+  card.querySelector('[data-rcs]').innerHTML = rcText(rowEff(c)) + expSum(c);
+  const i = card.querySelector('[data-ex]'); if (i.value !== (c.expiry || '')) i.value = c.expiry || '';
+  card.querySelector('[data-es]').innerHTML = c.expirySrc === '予測' ? `<span class="auto">予測</span> ${esc(c.expNote || '')}。目安です。パッケージの表示があれば直してください。<button type="button" class="b" data-xoff="${n}">予測を外す</button>` : '';
+}
+// 期限が空の行に、自動予測(確信度0.85以上)を入れる。手で触った行・在庫に期限がある品は触らない。読み込めなくても取り込みは進む
+async function autoExpDraft(only) {
+  if (!autoExp()) return; const gen = reviewGen;
+  try { await loadSL(); } catch { return; }
+  if (gen !== reviewGen) return;
+  for (const n of only === undefined ? draft.keys() : [only]) {
+    const c = draft[n]; if (!c || c.ue || c.gap || !String(c.name || '').trim() || (c.expirySrc && c.expirySrc !== '予測')) continue;
+    const ex = items.find((i) => norm(i.name) === norm(c.name));
+    const e = rowEff(c), base = /^\d{4}-\d{2}-\d{2}$/.test(c.boughtAt || '') ? c.boughtAt : todayStr();
+    let r = null; if (!(ex && ex.expiry && ex.qty > 0)) { try { r = SL.predictExpiry({ name: c.name, category: e.category, sub: e.sub, location: e.location, boughtAt: base, today: todayStr() }); } catch {} }
+    if (r) Object.assign(c, { expiry: r.date, expiryKind: r.kind, expirySrc: '予測', expiryFrom: base, expNote: `${r.basis}・買ってから約${r.days}日` });
+    else for (const k of ['expiry', 'expiryKind', 'expirySrc', 'expiryFrom', 'expNote']) delete c[k];
+    paintExp(n);
+  }
+}
+
 function reviewDialog() {
   const d = $('#dlg'), st = d.scrollTop, pvOld = d.querySelector('.phv'), pvPos = pvOld ? [pvOld.scrollLeft, pvOld.scrollTop] : null;
   delete d.dataset.cf;
@@ -771,7 +808,7 @@ function reviewDialog() {
     return `<div class="card rv" data-row="${n}"><div class="fl" data-fl="${n}"></div><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" list="rv-names" autocomplete="off" autocorrect="off" enterkeyhint="next" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
     <div class="rv2"><div><label>カテゴリ</label><select data-ct="${n}">${selOpts(withCur(categoryOptions(items), e.category), e.category)}</select></div>
     <div><label>数量</label><input data-q="${n}" type="number" inputmode="numeric" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" inputmode="numeric" enterkeyhint="next" min="0" value="${c.price || ''}"></div></div>
-    <details class="rvc" data-rc="${n}" ${rvOpen.has(c) ? 'open' : ''}><summary data-rcs="${n}">${rcText(e)}</summary><div class="grid2"><div><label>小分類</label><select data-sb="${n}">${selOpts(withCur(subOptions(e.category, items), e.sub), e.sub)}</select></div><div><label>置き場所</label><select data-lc="${n}">${selOpts(withCur(lo, e.location), e.location)}</select></div></div></details>
+    <details class="rvc" data-rc="${n}" ${rvOpen.has(c) ? 'open' : ''}><summary data-rcs="${n}">${rcText(e)}${expSum(c)}</summary><div class="grid2"><div><label>小分類</label><select data-sb="${n}">${selOpts(withCur(subOptions(e.category, items), e.sub), e.sub)}</select></div><div><label>置き場所</label><select data-lc="${n}">${selOpts(withCur(lo, e.location), e.location)}</select></div><div><label>期限</label><input type="date" data-ex="${n}" value="${esc(c.expiry || '')}"></div></div><div class="sub exs" data-es="${n}"></div></details>
     <div class="sub">${c.fix ? `<span class="fixd" data-fx="${n}">前回の修正を適用</span> ・ ` : ''}<span data-bg="${n}">${e.catSrc === 'auto' && e.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : e.catSrc === 'ctx' ? '<span class="auto">追加先</span> ' : ''}</span>${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}${c.gap ? ' ・ 検算用(在庫には登録しません)' : ''}</div></div>`;
   };
   const smTxt = (r) => `店名・日付: ${r.store || '(なし)'} ・ ${r.date ? dateJa(r.date) : '(日付なし)'}(タップで直す)`;
@@ -835,7 +872,7 @@ function reviewDialog() {
   d.querySelectorAll('[data-nm]').forEach((e) => {
     const n = +e.dataset.nm;
     e.oninput = () => { const c = draft[n]; c.name = e.value; if (c.fix) { c.fix = false; d.querySelector(`[data-fx="${n}"]`)?.remove(); } cnt(); refreshFlags(); };
-    e.onchange = () => { draft[n].checked = true; refreshFlags(); syncRow(n); }; // 手で直したら確認済み(名前が変わると自動の場所も変わる)
+    e.onchange = () => { draft[n].checked = true; refreshFlags(); syncRow(n); autoExpDraft(n); }; // 手で直したら確認済み(名前が変わると自動の場所も変わる)
     e.onfocus = () => { if (!flagsOf(draft[n])?.nm) return; const v = e.value; e.select(); setTimeout(() => e.value === v && e.select(), 0); }; // 崩れた名前は全選択 → そのまま打てば置き換わる/候補が出る
     e.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); const nx = flagged().find((i) => i > n); (nx === undefined ? d.querySelector(`[data-pr="${n}"]`) : d.querySelector(`[data-nm="${nx}"]`)).focus(); } }; // 次へ: 要確認の行が続くならそこへ(金額は合っていることが多い)
   });
@@ -844,12 +881,14 @@ function reviewDialog() {
     const c = draft[n], card = d.querySelector(`[data-row="${n}"]`); if (!card) return;
     const e = rowEff(c), set = (sel, arr, v) => { sel.innerHTML = selOpts(withCur(arr, v), v); };
     set(card.querySelector('[data-ct]'), categoryOptions(items), e.category); set(card.querySelector('[data-sb]'), subOptions(e.category, items), e.sub); set(card.querySelector('[data-lc]'), locationOptions(items), e.location);
-    card.querySelector('[data-rcs]').innerHTML = rcText(e);
+    card.querySelector('[data-rcs]').innerHTML = rcText(e) + expSum(c);
     card.querySelector('[data-bg]').innerHTML = e.catSrc === 'auto' && e.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : e.catSrc === 'ctx' ? '<span class="auto">追加先</span> ' : '';
   };
   d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { const c = draft[e.dataset.ct]; c.category = e.value; c.uc = true; c.us = false; delete c.sub; c.auto = false; syncRow(+e.dataset.ct); })); // 大分類を変えたら小分類はクリア
   d.querySelectorAll('[data-sb]').forEach((e) => (e.onchange = () => { const c = draft[e.dataset.sb], f = rowEff(c); c.category = f.category; c.uc = true; c.auto = false; c.us = true; if (e.value) c.sub = e.value; else delete c.sub; syncRow(+e.dataset.sb); }));
   d.querySelectorAll('[data-lc]').forEach((e) => (e.onchange = () => { const c = draft[e.dataset.lc]; c.ul = true; c.location = e.value; syncRow(+e.dataset.lc); }));
+  d.querySelectorAll('[data-ex]').forEach((e) => (e.oninput = () => { const c = draft[e.dataset.ex]; c.ue = true; c.expiry = e.value; if (e.value) { c.expirySrc = '手入力'; c.expiryFrom = /^\d{4}-\d{2}-\d{2}$/.test(c.boughtAt || '') ? c.boughtAt : todayStr(); } else for (const k of ['expiryKind', 'expirySrc', 'expiryFrom', 'expNote']) delete c[k]; paintExp(+e.dataset.ex); }));
+  d.querySelectorAll('[data-es]').forEach((e) => (e.onclick = (ev) => { const b = ev.target.closest('[data-xoff]'); if (!b) return; const n = +b.dataset.xoff, c = draft[n]; c.ue = true; for (const k of ['expiry', 'expiryKind', 'expirySrc', 'expiryFrom', 'expNote']) delete c[k]; paintExp(n); d.querySelector(`[data-ex="${n}"]`)?.focus(); }));
   d.querySelectorAll('[data-rc]').forEach((e) => (e.ontoggle = () => { const c = draft[e.dataset.rc]; if (c) e.open ? rvOpen.add(c) : rvOpen.delete(c); }));
   $('#acall')?.addEventListener('click', () => { // 手で変えた行も追加先に合わせる(追加先で選んだ項目だけ)
     for (const c of draft) { if (addCtx.category) { c.uc = c.us = false; } if (addCtx.location) c.ul = false; }
@@ -901,13 +940,16 @@ function reviewDialog() {
         if (!ex.category && e.category) { rec.category = e.category; if (!ex.sub && e.sub) rec.sub = e.sub; au = e.catSrc === 'auto'; }
         if (!ex.location && e.location) { rec.location = e.location; au = au || e.locSrc === 'auto'; }
         if (au) rec.auto = true;
+        if (c.expiry && (c.ue || !ex.expiry || ex.qty <= 0)) { if (c.expirySrc === '手入力') xsJudge(ex, c.expiry); putExpiry(rec, { date: c.expiry, kind: c.expiryKind, src: c.expirySrc || '手入力', from: c.expiryFrom || todayStr() }); }
       } else rec = { name: c.name.trim(), qty: c.qty, category: e.category, ...(e.sub ? { sub: e.sub } : {}), location: e.location, minQty: 0, buyQty: 1, price: c.price || 0, boughtAt: c.boughtAt || '', source: c.source, srcKeys: keys, ...(e.auto ? { auto: true } : {}) };
+      if (!ex && c.expiry) putExpiry(rec, { date: c.expiry, kind: c.expiryKind, src: c.expirySrc || '手入力', from: c.expiryFrom || todayStr() });
       if (rec.location) wheres.add(rec.location);
       rec = withLog(ex || null, rec); // 数量の履歴を追記
       save(rec).catch(() => {}); byName.set(norm(c.name), rec); n++; // 送信は待たず、失敗は toast で知らせる
     }
     d.close(); toast(`${wheres.size === 1 ? `${[...wheres][0]}に` : ''}${n}件を登録しました`); tab = 'stock'; render();
   };
+  draft.forEach((c, n) => c.expirySrc === '予測' && paintExp(n));
   refresh(true); cnt(); ctxHook = () => reviewDialog(); // 追加先が変わったら、画面を作り直す(手で変えていない行が追加先に変わる)
   const sync = () => d.style.setProperty('--phh', `${$('#phbar').offsetHeight}px`);
   openDlg('review');
@@ -943,6 +985,7 @@ function barcodeForm(d, code0) {
     <div class="sub" id="b-note" role="status" aria-live="polite" style="margin-top:4px"></div><div id="b-help" hidden></div>
     <div class="grid2"><div><label for="b-q">${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" inputmode="numeric" enterkeyhint="done" min="1" value="1"></div>
     <div><label for="b-c">カテゴリ</label><select id="b-c"></select></div><div><label for="b-s">小分類</label><select id="b-s"></select></div><div><label for="b-l">置き場所</label><select id="b-l"></select></div></div>
+    <div class="exr" id="b-ex"><div class="exl" id="b-et" role="status" aria-live="polite"></div><div class="exa"><label class="b filebtn">📷 写真で読む<input type="file" accept="image/*" capture="environment" class="vh" id="b-ep"></label><button type="button" class="b" id="b-ei">入力</button><button type="button" class="b" id="b-ex-x" hidden>外す</button></div></div>
     <div class="sub" id="b-h" style="margin-top:4px">${ex ? '登録済みの商品なので、置き場所・分類はそのままです(変えるときだけ選びます)。' : ''}</div>
     <div class="btns" style="margin-top:12px"><button type="button" class="b" id="bx">終了</button><button type="submit" class="b p grow" id="bok">${ex ? '数量を追加して次へ' : '登録して次へ'}</button></div></form>`;
     const n = d.querySelector('#b-n'); let typed = false, stopUi = () => {};
@@ -951,13 +994,43 @@ function barcodeForm(d, code0) {
       onChange: () => { if (!ex) d.querySelector('#b-h').textContent = cf.hint(); } });
     ctxHook = () => cf.recompute();
     cf.recompute();
-    n.oninput = () => { typed = true; if (!ex) cf.recompute(); };
-    const apply = (name, fromOcr) => { n.value = name; if (fromOcr) typed = true; cf.recompute(); }; // 検索結果・OCRの候補を名前欄へ。分類は 手で選んだ値 > 追加先 > 名前からの推定
+    // 期限の行: 触らなくても登録できる。手で決めていなければ 前回 > 予測 の順で自動で入れる(外せる)。登録済みの品は、いまの期限をそのまま(期限が空・在庫0なら新しい期限を提案)
+    const B = { date: '', kind: '', src: '', from: '', note: '', user: false };
+    const keepEx = () => !!(ex && ex.expiry && ex.qty > 0);
+    const paintB = () => {
+      const et = d.querySelector('#b-et'); if (!et) return; // 画面が次の読み取りに変わったあとは何もしない
+      const est = estSrc(B.src) ? `<span class="auto">${B.src === '前回' ? '前回から' : '予測'}</span> ` : '';
+      et.innerHTML = B.date ? `期限: ${est}<b>${dateJa(B.date)}</b>(${relJa(B.date)})${B.kind ? ` ・ ${B.kind}` : ''}${estSrc(B.src) ? '<br><span class="sub">目安です。パッケージの表示があれば、写真か入力で直せます。</span>' : ''}`
+        : keepEx() ? `期限: いまのまま <b>${dateJa(ex.expiry)}</b>(${relJa(ex.expiry)})${estSrc(ex.expirySrc) ? ` ${ex.expirySrc === '前回' ? '(前回から)' : '(予測)'}` : ''}` : '期限: 未設定';
+      d.querySelector('#b-ex-x').hidden = !B.date;
+      d.querySelector('#b-ei').textContent = keepEx() && !B.date ? '新しい期限を入れる' : '入力';
+    };
+    let tok = 0, expP = Promise.resolve();
+    const compute = async () => {
+      if (B.user) return; const my = ++tok, name = n.value.trim();
+      Object.assign(B, { date: '', kind: '', src: '', from: '', note: '' });
+      if (keepEx() || !name || !autoExp()) return paintB();
+      const pv = prevInterval(name, code);
+      if (pv) Object.assign(B, { date: plusDays(todayStr(), pv.days), kind: pv.kind, src: '前回', from: todayStr(), note: `前回は買ってから${pv.days}日でした` });
+      else { const v = cf.values(), r = await predictSafe({ name, category: v.category, sub: v.sub, location: v.location }); if (my !== tok || B.user) return; if (r) Object.assign(B, { date: r.date, kind: r.kind, src: '予測', from: todayStr(), note: r.basis }); }
+      paintB();
+    };
+    let ct; const recompute = () => { clearTimeout(ct); ct = setTimeout(() => (expP = compute()), 250); };
+    expP = compute(); paintB();
+    const setB = (r) => { Object.assign(B, { date: r.date, kind: KINDS.includes(r.kind) ? r.kind : '', src: r.src, from: todayStr(), note: '', user: true }); paintB(); };
+    d.querySelector('#b-ep').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) expirySheet(f, { from: e.target, onPick: (r) => setB({ ...r, src: '写真' }) }); };
+    d.querySelector('#b-ex-x').onclick = () => { tok++; Object.assign(B, { date: '', kind: '', src: '', from: '', note: '', user: true }); paintB(); d.querySelector('#b-ei').focus(); };
+    d.querySelector('#b-ei').onclick = () => expiryInputSheet(B, { info: () => { const v = cf.values(); return { name: n.value, category: v.category, sub: v.sub, location: v.location }; }, code, from: d.querySelector('#b-ei'), onDone: (S) => { tok++; Object.assign(B, { date: S.date, kind: S.kind, src: S.date ? S.src : '', from: S.date ? S.from : '', note: S.note || '', user: true }); paintB(); } });
+    n.oninput = () => { typed = true; if (!ex) cf.recompute(); recompute(); };
+    const apply = (name, fromOcr) => { n.value = name; if (fromOcr) typed = true; cf.recompute(); recompute(); }; // 検索結果・OCRの候補を名前欄へ。分類は 手で選んだ値 > 追加先 > 名前からの推定
     if (!ex) stopUi = ui.mountLookup(d, { code, input: n, apply, isTyped: () => typed });
     d.querySelector('#bx').onclick = () => { stopUi(); resolve(false); };
-    d.querySelector('#b-form').onsubmit = (ev) => {
+    let sent = false;
+    d.querySelector('#b-form').onsubmit = async (ev) => {
       ev.preventDefault();
       const name = n.value.trim(); if (!name) return toast('名前を入れてください');
+      if (sent) return; sent = true;
+      if (!B.user) await Promise.race([expP, new Promise((r) => setTimeout(r, 500))]); // 自動の期限が計算中なら、少しだけ待つ
       const add = Math.max(1, +d.querySelector('#b-q').value || 1);
       const same = ex || items.find((i) => norm(i.name) === norm(name)), v = cf.values();
       stopUi();
@@ -968,11 +1041,224 @@ function barcodeForm(d, code0) {
         if (catNew) { rec.category = v.category; if (v.sub) rec.sub = v.sub; else delete rec.sub; }
         if (locNew) rec.location = v.location;
         if ((catNew || locNew) && v.auto) rec.auto = true; else if (v.touched.c || v.touched.s || v.touched.l) delete rec.auto;
-      } else rec = { name, qty: add, category: v.category, ...(v.sub ? { sub: v.sub } : {}), location: v.location, minQty: 0, buyQty: 1, barcode: code, source: 'barcode', ...(v.auto ? { auto: true } : {}) };
+        if (B.date) { if (B.src === '手入力' || B.src === '写真') xsJudge(same, B.date); putExpiry(rec, B); } // 数量を足すだけなら期限は変えない(新しい期限を入れたときだけ更新)
+      } else { rec = { name, qty: add, category: v.category, ...(v.sub ? { sub: v.sub } : {}), location: v.location, minQty: 0, buyQty: 1, barcode: code, source: 'barcode', ...(v.auto ? { auto: true } : {}) }; if (B.date) putExpiry(rec, B); }
       saveQty(same || null, rec).catch(() => {});
-      toast(`${name} を${rec.location ? `${rec.location}に` : ''}追加しました`); resolve(true);
+      toast(`${name} を${rec.location ? `${rec.location}に` : ''}追加しました${B.date && estSrc(B.src) ? `(期限は${B.src === '前回' ? '前回から' : '予測'} ${dateJa(B.date)})` : ''}`); resolve(true);
     };
   });
+}
+
+// ---------- 期限(写真・手入力・予測) ----------
+// expirySrc: 手入力・写真(=パッケージの表示。無印の旧データも同じ扱い) > 前回 > 予測。予測と前回は「目安」として画面で区別する
+// expiryFrom: 期限の起算日(購入日)。「前回は買ってから◯日」と的中率の計算に使う(boughtAt は「買った」で上書きされるので別に持つ)
+const pad2 = (n) => String(n).padStart(2, '0');
+const todayStr = () => { const n = new Date(); return `${n.getFullYear()}-${pad2(n.getMonth() + 1)}-${pad2(n.getDate())}`; };
+const dayNo = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || ''); return m ? Math.round(Date.UTC(+m[1], +m[2] - 1, +m[3]) / 864e5) : NaN; };
+const plusDays = (s, n) => { const t = new Date((dayNo(s) + n) * 864e5); return `${t.getUTCFullYear()}-${pad2(t.getUTCMonth() + 1)}-${pad2(t.getUTCDate())}`; };
+const relJa = (date) => { const d = dayNo(date) - dayNo(todayStr()); return d < 0 ? `${-d}日前` : d === 0 ? '今日' : `${d}日後`; };
+const estSrc = (s) => s === '予測' || s === '前回';
+const KINDS = ['賞味', '消費'];
+// 部品は使うときに読み込む(起動を軽く。失敗しても保存・追加は進む)
+let SL = null, slP = null, eoP = null;
+const loadSL = () => (slP ||= import('./shelflife.js').then((m) => (SL = m), (e) => { slP = null; throw e; }));
+const loadEO = () => (eoP ||= import('./expiry-ocr.js').catch((e) => { eoP = null; throw e; }));
+// 予測(確信度 0.85 以上のみ)。読み込めない・時間切れ・予測なしは null
+const predictNow = (info) => { try { return SL.predictExpiry({ ...info, today: todayStr() }) || null; } catch { return null; } };
+const predictSafe = async (info, ms = 1500) => {
+  if (SL) return predictNow(info); // 読み込み済みなら待たない(連続追加を遅くしない)
+  try { const m = await Promise.race([loadSL(), new Promise((_, rj) => setTimeout(() => rj(new Error('timeout')), ms))]); return m.predictExpiry({ ...info, today: todayStr() }) || null; } catch { return null; }
+};
+const autoExp = () => { try { return localStorage.getItem('hs-autoexp') !== '0'; } catch { return true; } };
+const newId = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+// 期限の状態 S({date, kind, src, from})を品目 rec に書く。空なら期限と関連項目を消す(undefined は入れない)
+function putExpiry(rec, S) {
+  if (S.date) { rec.expiry = S.date; for (const [k, v] of [['expiryKind', S.kind], ['expirySrc', S.src], ['expiryFrom', S.from]]) if (v) rec[k] = v; else delete rec[k]; }
+  else { rec.expiry = ''; for (const k of ['expiryKind', 'expirySrc', 'expiryFrom']) delete rec[k]; }
+  return rec;
+}
+const noExp = (i) => putExpiry({ ...i }, {});
+// 同じバーコード(なければ同名)の過去の品の「買ってから期限まで」の日数。パッケージの表示(手入力・写真)で入れたものだけ
+function prevInterval(name, code) {
+  const nn = norm(name); if (!nn && !code) return null;
+  let a = code ? items.filter((i) => i.barcode && canonCode(i.barcode) === code) : [];
+  if (!a.length) a = items.filter((i) => norm(i.name) === nn);
+  const c = a.filter((i) => i.expiry && !estSrc(i.expirySrc)).map((i) => ({ i, days: dayNo(i.expiry) - dayNo(i.expiryFrom || i.boughtAt) })).filter((x) => x.days > 0 && x.days <= 1100).sort((p, q) => (q.i.updatedAt || 0) - (p.i.updatedAt || 0));
+  return c.length ? { days: c[0].days, kind: c[0].i.expiryKind || '' } : null;
+}
+// 予測の的中率の記録(端末ごと: hs-expstats {n, hit, long})。的中の許容は評価と同じ: 実際の期間が10日以内は±2日、30日以内は±20%か4日の大きい方、それ以上は±25%
+const XKEY = 'hs-expstats', XMAX = 9999;
+const xsLoad = () => { try { const o = JSON.parse(localStorage.getItem(XKEY)); return { n: Math.min(XMAX, Math.max(0, +o.n || 0)), hit: Math.max(0, +o.hit || 0), long: Math.max(0, +o.long || 0) }; } catch { return { n: 0, hit: 0, long: 0 }; } };
+const xsSave = (o) => { try { o.n ? localStorage.setItem(XKEY, JSON.stringify(o)) : localStorage.removeItem(XKEY); } catch {} };
+const xsAdd = (hit, long) => { const s = xsLoad(); if (s.n >= XMAX) return; xsSave({ n: s.n + 1, hit: s.hit + (hit ? 1 : 0), long: s.long + (long ? 1 : 0) }); };
+const withinTol = (pd, ad) => Math.abs(pd - ad) <= (ad <= 10 ? 2 : ad <= 30 ? Math.max(4, ad * 0.2) : ad * 0.25);
+// 予測・前回の品 old について、実際の日付 date に直した(date)/「合っていた」を押した(null)結果を記録。予測が実際より長い誤りは「長すぎ」
+function xsJudge(old, date) {
+  if (!old || !estSrc(old.expirySrc) || !old.expiry) return;
+  if (date === null) return xsAdd(true, false);
+  const f = dayNo(old.expiryFrom), pd = dayNo(old.expiry) - f, ad = dayNo(date) - f;
+  if (!Number.isFinite(pd) || !Number.isFinite(ad)) return;
+  const hit = withinTol(pd, ad); xsAdd(hit, !hit && pd > ad);
+}
+const mkDlg = (id) => { let s = $('#' + id); if (!s) { s = document.createElement('dialog'); s.id = id; s.setAttribute('aria-labelledby', id + '-h'); document.body.append(s); } return s; };
+const fullDate = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || ''); return m ? `${m[1]}年${+m[2]}月${+m[3]}日` : ''; };
+
+// 期限の入力部品(編集ダイアログと、バーコードの「入力」シートで共通)。S {date, kind, src, from, note, confirmed} を書き換える
+// o: { p: id の接頭辞, S, info(): {name, category, sub, location}, prev(): 前回の日数, bought(): 購入日, ok: 「合っていた」を出すか, onChange() }
+function expiryEditor(host, o) {
+  const { S, p } = o; let flash = '';
+  host.innerHTML = `<label for="${p}e">賞味・消費期限</label><input id="${p}e" type="date" value="${esc(S.date || '')}">
+  <div class="chips ek" role="group" aria-label="期限の種類">${KINDS.map((k) => `<button type="button" class="chip" data-k="${k}" aria-pressed="false">${k}期限</button>`).join('')}</div>
+  <div class="exs" data-st role="status" aria-live="polite"></div><div class="exw" data-w role="status"></div><div class="exc" data-c></div>
+  <div class="exb"><label class="b filebtn">📷 撮って読む<input type="file" accept="image/*" capture="environment" class="vh" data-ph></label><label class="b filebtn">🖼 アルバムから<input type="file" accept="image/*" class="vh" data-ph></label>
+  <button type="button" class="b" data-a="pred">🔮 予測で入れる</button><button type="button" class="b" data-a="prev" hidden></button><button type="button" class="b" data-a="open" hidden>📦 開封した</button><button type="button" class="b" data-a="ok" hidden>👍 合っていた</button></div>`;
+  const q = (s) => host.querySelector(s), inp = q(`#${p}e`);
+  const openR = () => { if (!SL) return null; const i = o.info(); if (!String(i.name || '').trim()) return null; try { return SL.predictExpiry({ ...i, today: todayStr(), opened: true }); } catch { return null; } };
+  const paint = () => {
+    if (inp.value !== (S.date || '')) inp.value = S.date || '';
+    host.querySelectorAll('[data-k]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.k === S.kind));
+    const when = S.date ? `${dateJa(S.date)}(${relJa(S.date)})` : '';
+    q('[data-st]').innerHTML = flash || (!S.date ? 'パッケージに期限が書いてあれば、写真か日付で入れます。書いていなければ「予測で入れる」を使えます。'
+      : S.src === '予測' ? `<span class="auto">予測</span> <b>${when}</b><br>${esc(S.note || '')}。標準的な期間にもとづく目安で、パッケージの表示と同じとは限りません。表示があれば必ずそちらを使ってください。`
+      : S.src === '前回' ? `<span class="auto">前回から</span> <b>${when}</b><br>${esc(S.note || '')}。パッケージの表示があれば、そちらを使ってください。`
+      : S.src === '写真' ? '📷 写真から読み取った日付です。' : S.confirmed ? '👍 合っていると確認しました。' : '');
+    flash = '';
+    const t = todayStr(), w = [];
+    if (S.date) {
+      const b = o.bought?.(), d = dayNo(S.date);
+      if (d < dayNo(t)) w.push('過去の日付です(すでに期限が切れています)');
+      if (b && d < dayNo(b)) w.push('購入日より前の日付です');
+      if (d - dayNo(t) > 3652) w.push('10年以上先の日付です');
+    }
+    q('[data-w]').textContent = w.length ? `⚠ 日付を確認してください: ${w.join('、')}` : '';
+    const pv = o.prev?.(), pb = q('[data-a=prev]'); pb.hidden = !pv; if (pv) pb.textContent = `🕘 前回の期限を使う(前回は買ってから${pv.days}日)`;
+    q('[data-a=ok]').hidden = !(o.ok && estSrc(S.src) && S.date && !S.confirmed);
+    q('[data-a=open]').hidden = !openR();
+    o.onChange?.();
+  };
+  const set = (r) => {
+    S.date = r.date; if (KINDS.includes(r.kind)) S.kind = r.kind; S.src = r.src; S.from = r.from || todayStr(); S.note = r.note || ''; S.confirmed = false; paint();
+  };
+  inp.oninput = () => { S.date = inp.value; S.src = S.date ? '手入力' : ''; S.from = S.date ? todayStr() : ''; S.note = ''; S.confirmed = false; paint(); };
+  host.querySelectorAll('[data-ph]').forEach((f) => (f.onchange = () => { const file = f.files[0]; f.value = ''; if (file) expirySheet(file, { from: f, onPick: (r) => set({ ...r, src: '写真' }) }); }));
+  host.onclick = async (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.k) { S.kind = S.kind === b.dataset.k ? '' : b.dataset.k; return paint(); }
+    const a = b.dataset.a, box = q('[data-c]');
+    if (a === 'pred') {
+      b.disabled = true; let r = null, err = false;
+      try { const m = await loadSL(); r = m.predictExpiry({ ...o.info(), today: todayStr() }); } catch { err = true; }
+      b.disabled = false;
+      if (r) return set({ date: r.date, kind: r.kind, src: '予測', note: `${r.basis}・買ってから約${r.days}日` });
+      flash = err ? '予測の部品を読み込めませんでした。通信を確かめてください(期限は手で入れられます)。' : 'この品は予測できません(種類によって期間が大きく違うためです)。期限が書いてあれば、写真か入力で入れてください。';
+      paint();
+    } else if (a === 'prev') { const pv = o.prev(); if (pv) set({ date: plusDays(todayStr(), pv.days), kind: pv.kind, src: '前回', note: `前回は買ってから${pv.days}日でした` }); }
+    else if (a === 'ok') { S.confirmed = true; S.src = '手入力'; paint(); }
+    else if (a === 'open') {
+      const r = openR(); if (!r) return;
+      const later = S.date && !estSrc(S.src) && dayNo(r.date) > dayNo(S.date);
+      box.innerHTML = `<div class="exq"><p><b>開封後の目安に変えますか?</b><br>${dateJa(r.date)}(${relJa(r.date)}) ・ ${esc(r.basis)}${later ? '<br>いまの期限(表示)のほうが早いです。変えると期限が延びます。' : ''}</p><div class="row"><button type="button" class="b" data-a="oc">やめる</button><button type="button" class="b p grow" data-a="oy">変える</button></div></div>`;
+      box.querySelector('[data-a=oc]').focus();
+    } else if (a === 'oc') { box.innerHTML = ''; q('[data-a=open]').focus(); }
+    else if (a === 'oy') { const r = openR(); box.innerHTML = ''; if (r) set({ date: r.date, kind: r.kind, src: '予測', note: `${r.basis}・開封後の目安` }); q('[data-a=open]').focus(); }
+  };
+  paint();
+  return { paint, set, warm: () => loadSL().then(paint, () => {}) };
+}
+
+// 期限の写真を読んで、候補を確認するシート。写真は端末のメモリ(ObjectURL)だけで持ち、閉じると手放す。自動では保存せず、必ず確認を通す
+// o: { from: 閉じたあとにフォーカスを戻す要素, onPick({date, kind}) }
+function expirySheet(file, o) {
+  const s = mkDlg('exs'); s._end?.(); if (s.open) s.close(); // 前のシートの後始末を先にする(close イベントは遅れて届くため)
+  const url = URL.createObjectURL(file), ac = new AbortController(), today = todayStr();
+  let timer = null, res = null, pick = { date: '', kind: '' }, t0 = 0, pct = 0, cancelled = false;
+  let ended = false;
+  const end = () => { if (ended) return; ended = true; cancelled = true; ac.abort(); clearInterval(timer); URL.revokeObjectURL(url); };
+  s._end = end; s.onclose = () => { if (s.open || ended) return; end(); o.from?.focus?.({ preventScroll: true }); };
+  const thumb = `<button type="button" class="exth" data-big aria-label="写真を全画面で見る"><img src="${url}" alt="期限を撮った写真"></button>`;
+  const head = (t) => `<h3 id="exs-h" tabindex="-1">${t}</h3>`;
+  const foc = () => s.querySelector('#exs-h')?.focus({ preventScroll: true });
+  s.onclick = (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.big !== undefined) return openViewer(url, '期限の写真');
+    if (b.dataset.x !== undefined) return s.close();
+    if (b.dataset.cancel !== undefined) { ac.abort(); return; }
+    if (b.dataset.go !== undefined) return read();
+    if (b.dataset.prep !== undefined) return prep(b);
+    if (b.dataset.use !== undefined) { if (!pick.date) return; const r = { ...pick }; s.close(); o.onPick(r); return; }
+    if (b.dataset.k) { pick.kind = pick.kind === b.dataset.k ? '' : b.dataset.k; return mark(); }
+    if (b.dataset.c !== undefined) { const c = res.cands[+b.dataset.c]; pick = { date: c.date, kind: KINDS.includes(c.kind) ? c.kind : '' }; return mark(); }
+  };
+  s.oninput = (e) => { if (e.target.id === 'exs-d') { pick.date = e.target.value; mark(); } };
+  const mark = () => {
+    const sel = res?.cands.findIndex((c) => c.date === pick.date) ?? -1;
+    s.querySelectorAll('[data-c]').forEach((b) => b.setAttribute('aria-pressed', +b.dataset.c === sel));
+    s.querySelectorAll('[data-k]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.k === pick.kind));
+    const d = s.querySelector('#exs-d'); if (d && d.value !== pick.date) d.value = pick.date;
+    const w = [], dn = dayNo(pick.date);
+    if (pick.date) { if (dn < dayNo(today)) w.push('過去の日付です'); if (dn - dayNo(today) > 3652) w.push('10年以上先の日付です'); }
+    s.querySelector('#exs-w').textContent = w.length ? `⚠ 日付を確認してください: ${w.join('、')}` : '';
+    s.querySelector('[data-use]').disabled = !pick.date;
+  };
+  const manual = () => `<label for="exs-d">日付(写真を見ながら入力・修正)</label><input id="exs-d" type="date"><div class="chips ek" role="group" aria-label="期限の種類">${KINDS.map((k) => `<button type="button" class="chip" data-k="${k}" aria-pressed="false">${k}期限</button>`).join('')}</div><div class="exw" id="exs-w" role="status"></div>`;
+  const foot = (extra = '') => `<div class="btns" style="margin-top:12px"><button type="button" class="b" data-x>やめる</button>${extra}<button type="button" class="b p grow" data-use disabled>この日付を使う</button></div>`;
+  const show = () => { if (!s.open) s.showModal(); foc(); };
+  const prep = async (b) => {
+    b.disabled = true; b.textContent = '準備中…';
+    try { const m = await loadEO(); const ok = await m.warmupExpiryOcr((p) => { b.textContent = `準備中 ${Math.round(p * 100)}%`; }); if (ok) { try { localStorage.setItem('hs-ocr-ready', '1'); } catch {} } } catch {}
+    if (!cancelled) read();
+  };
+  const fail = (msg) => { res = { cands: [] }; s.innerHTML = `${head('読み取れませんでした')}${thumb}<p>${esc(msg)}</p>${manual()}${foot()}`; mark(); foc(); };
+  const confirmView = () => {
+    const r = res.r, cands = res.cands, best = r.best, n = r.notes || {};
+    const notes = [r.usedFallback ? '簡易な読み取りを使ったため、精度が下がります。' : '', n.note ? `写真に「${esc(n.note)}」とあります。日付は別の場所に印字されているかもしれません。` : '',
+      ...(n.mfg || []).map((m) => `製造日らしい日付: ${esc(dateJa(m.date))}(期限としては使いません)`), ...(n.opened || []).map((m) => `「開封後は${m.days}日以内」と書かれています(期限ではないので入れていません)`)].filter(Boolean);
+    const lv = (c) => (c >= 0.8 ? '自信 高' : c >= 0.6 ? '自信 中' : '自信 低');
+    s.innerHTML = `${head(best ? 'この日付で合っていますか?' : 'これで合っていますか?')}${thumb}
+      <p class="sub">${best ? '読み取った日付です。写真の印字と、数字を1文字ずつ見比べてください(1文字だけの読み違いは、アプリでは見つけられません)。' : '読み取りの自信が低い候補です。写真と見比べて、合っているものだけ選んでください。'}</p>
+      <div class="cands" role="group" aria-label="読み取った候補">${cands.map((c, i) => `<button type="button" class="cand" data-c="${i}" aria-pressed="false"><span class="cd">${fullDate(c.date)}</span><span class="cr">${relJa(c.date)} ・ ${c.kind === '不明' ? '種類は不明' : `${c.kind}期限`} ・ ${lv(c.conf)}</span>${c.label ? `<span class="cl">${esc(c.label)}</span>` : ''}</button>`).join('')}</div>
+      ${notes.length ? `<ul class="tips">${notes.map((x) => `<li>${x}</li>`).join('')}</ul>` : ''}
+      <details class="more"><summary>ちがうとき: 日付を直す</summary>${manual()}</details>${foot()}`;
+    if (best) { pick = { date: best.date, kind: KINDS.includes(best.kind) ? best.kind : '' }; }
+    mark(); foc();
+  };
+  const read = async () => {
+    t0 = Date.now(); pct = 0;
+    s.innerHTML = `${head('読み取り中…')}${thumb}<div class="rdg"><div role="status"><span id="exs-t"></span></div><div class="sub" id="exs-n" role="status"></div><button type="button" class="b d" data-cancel>やめる(手入力にする)</button></div>`;
+    const paint = () => { const sec = Math.floor((Date.now() - t0) / 1000); const t = s.querySelector('#exs-t'), n = s.querySelector('#exs-n'); if (t) t.textContent = `${pct}% ・ ${sec}秒`; if (n) n.textContent = sec >= 10 ? 'しばらくかかります。待たずに「やめる」を押して、写真を見ながら入力することもできます。' : ''; };
+    clearInterval(timer); timer = setInterval(paint, 500); paint(); foc();
+    try {
+      const m = await loadEO();
+      const r = await m.readExpiryFromPhoto(file, { onProgress: (p) => { pct = Math.round(p * 100); }, signal: ac.signal, today });
+      if (cancelled) return; clearInterval(timer);
+      const cands = [...(r.candidates || [])].sort((a, b) => b.conf - a.conf).slice(0, 4);
+      if (!cands.length) return fail('日付を見つけられませんでした。写真を見ながら入力してください。');
+      res = { r, cands }; confirmView();
+    } catch (e) {
+      if (cancelled) return; clearInterval(timer);
+      fail(e?.name === 'AbortError' ? '読み取りをやめました。写真を見ながら入力してください。' : '読み取りに失敗しました。写真を見ながら入力してください。');
+    }
+  };
+  (async () => {
+    s.innerHTML = `${head('期限を読み取る')}${thumb}<p class="sub" role="status">準備しています…</p>`; show();
+    let ready = false; try { ready = await (await loadEO()).isExpiryOcrReady(); } catch {}
+    if (cancelled) return;
+    if (ready) return read();
+    s.innerHTML = `${head('読み取りの準備')}${thumb}<p>初回だけ、読み取り用のデータ(約34MB)をダウンロードします。Wi-Fiでの利用をおすすめします。</p>
+      <div class="btns"><button type="button" class="b" data-x>やめる</button><button type="button" class="b" data-go>そのまま読む</button><button type="button" class="b p grow" data-prep>準備する(約34MB)</button></div>`;
+    foc();
+  })();
+}
+
+// バーコードの「入力」: 期限を入れる小さなシート(編集ダイアログの期限と同じ部品)。決定で onDone(S)
+function expiryInputSheet(B, o) {
+  const s = mkDlg('exi'); if (s.open) s.close();
+  const S = { date: B.date, kind: B.kind, src: B.src, from: B.from, note: B.note, confirmed: false };
+  s.innerHTML = '<h3 id="exi-h" tabindex="-1">期限を入れる</h3><div id="exi-ed"></div><div class="btns" style="margin-top:12px"><button type="button" class="b" data-x>やめる</button><button type="button" class="b p grow" data-ok>決定</button></div>';
+  const ed = expiryEditor(s.querySelector('#exi-ed'), { p: 'x-', S, info: o.info, prev: () => prevInterval(o.info().name, o.code) });
+  s.onclick = (e) => { const b = e.target.closest('button'); if (!b) return; if (b.dataset.x !== undefined) s.close(); else if (b.dataset.ok !== undefined) { const r = { ...S }; s.close(); o.onDone(r); } };
+  s.onclose = () => { if (!s.open) o.from?.focus?.({ preventScroll: true }); };
+  s.showModal(); ed.warm(); s.querySelector('#exi-h').focus({ preventScroll: true });
 }
 
 // ---------- 編集 ----------
@@ -990,15 +1276,19 @@ function editDialog(it, memo, focus) {
   <div data-grp="class"><div class="grid2"><div><label for="f-c">カテゴリ</label><select id="f-c"></select></div><div><label for="f-s">小分類</label><select id="f-s"></select></div><div><label for="f-l">置き場所</label><select id="f-l"></select></div></div><div class="sub" id="f-h" role="status"></div></div>
   <div data-grp="stock" class="grid2"><div><label for="f-m">買い足しライン(この数になったら買い物リストに出す)</label><input id="f-m" type="number" inputmode="numeric" min="0" value="${x.minQty || 0}"></div>
   <div><label for="f-b">買うときの個数</label><input id="f-b" type="number" inputmode="numeric" min="1" value="${x.buyQty || 1}"></div></div>
-  <div data-grp="expiry"><label for="f-e">賞味・使用期限</label><input id="f-e" type="date" value="${esc(x.expiry || '')}"></div></details>
+  <div data-grp="expiry" id="f-ex"></div></details>
   <div class="btns" style="margin-top:12px">${it ? '' : '<button type="button" class="b" id="again" style="order:2">続けて追加</button>'}<button type="submit" class="b p grow" id="ok" style="order:3">${it ? '保存' : '追加'}</button><button type="button" class="b" id="cx" style="order:1">やめる</button></div>
   ${it ? '<div class="danger"><button type="button" class="b d" id="del" style="width:100%">この品目を削除</button></div>' : ''}</form>`; // Tab順は 続けて追加→追加→やめる(見た目は やめる・続けて追加・追加)
   const fC = $('#f-c'), fS = $('#f-s'), fL = $('#f-l');
+  const S = { date: x.expiry || '', kind: x.expiryKind || '', src: x.expirySrc || '', from: x.expiryFrom || '', note: '', confirmed: false }; // 期限の状態(出どころつき)
   const sum = () => { // 追加先で決めた分は上のバーに出ているので、ここには入れない
-    const sr = cf?.values().src || {}, t = [+$('#f-m').value ? `${$('#f-m').value}以下で買い足し` : '', $('#f-e').value ? `期限 ${dateJa($('#f-e').value)}` : '', sr.c === 'ctx' ? '' : fC.value, sr.s === 'ctx' ? '' : fS.value, sr.l === 'ctx' ? '' : fL.value].filter(Boolean).join(' ・ ');
+    const sr = cf?.values().src || {}, t = [+$('#f-m').value ? `${$('#f-m').value}以下で買い足し` : '', S.date ? `期限 ${dateJa(S.date)}${estSrc(S.src) ? `(${S.src === '前回' ? '前回から' : '予測'})` : ''}` : '', sr.c === 'ctx' ? '' : fC.value, sr.s === 'ctx' ? '' : fS.value, sr.l === 'ctx' ? '' : fL.value].filter(Boolean).join(' ・ ');
     $('#f-sum').textContent = `くわしく設定${t ? `(${t})` : ''}`;
   };
   const cf = classForm({ fC, fS, fL, getName: () => $('#f-n').value, id: x.id, init: { category: xc, sub: x.sub, location: xl, auto: x.auto }, useCtx: !it, onChange: () => { $('#f-h').textContent = cf.hint(); sum(); } });
+  const ed = expiryEditor($('#f-ex'), { p: 'f-', S, ok: true, info: () => ({ name: $('#f-n').value, category: fC.value, sub: fS.value, location: fL.value }), bought: () => x.boughtAt || '', prev: () => prevInterval($('#f-n').value, canonCode(x.barcode || '')), onChange: sum });
+  $('#f-form > details.more').addEventListener('toggle', (e) => { if (e.target.open) ed.warm(); });
+  if (!it && autoExp()) setTimeout(() => loadSL().catch(() => {}), 400); // 保存時の自動予測のために先に読んでおく
   const dupOf = () => (it ? null : items.find((i) => norm(i.name) === norm($('#f-n').value) && $('#f-n').value.trim()));
   const suggest = () => {
     cf.recompute();
@@ -1006,25 +1296,40 @@ function editDialog(it, memo, focus) {
     $('#f-dup').textContent = ex ? `「${ex.name}」は登録済みです(いま ${ex.qty})。追加すると数量が足されます(場所・分類はそのまま)。` : '';
     $('#ok').textContent = ex ? '数量を足す' : it ? '保存' : '追加';
   };
-  $('#f-n').oninput = suggest; suggest();
+  $('#f-n').oninput = () => { suggest(); ed.paint(); }; suggest();
   if (!it) ctxHook = suggest; // 追加先が変わったら、名前から決めた分を計算し直す
-  ['f-m', 'f-e'].forEach((k) => ($(`#${k}`).oninput = sum));
+  $('#f-m').oninput = sum;
   const step = (n) => { const q = $('#f-q'); q.value = Math.max(0, (+q.value || 0) + n); };
   $('#f-qm').onclick = () => step(-1); $('#f-qp').onclick = () => step(1);
   $('#cx').onclick = () => d.close();
   $('#del')?.addEventListener('click', () => { d.close(); store.remove(it.id).catch((e) => toast(`削除できませんでした: ${e.code || e.message}`)); toast(`「${it.name}」を削除しました`, () => save(it)); });
-  const submit = (again) => {
+  let busy = false;
+  const submit = async (again) => {
     const name = $('#f-n').value.trim(); if (!name) { toast('名前を入れてください'); $('#f-n').focus(); return; }
-    const qty = +$('#f-q').value || 0, ex = dupOf(), v = cf.values(); let wh = '';
-    if (ex) saveQty(ex, { ...ex, qty: ex.qty + qty }).catch(() => {}); // 同名の品は数量だけ足す(場所・分類は変えない)
-    else {
-      const rec = { ...x, name, qty, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: v.category, location: v.location };
+    if (busy) return; busy = true;
+    const qty = +$('#f-q').value || 0, ex = dupOf(), v = cf.values(); let wh = '', auto = null, undo = null;
+    // 新しい品で期限が空なら、自動予測が有効なとき予測を入れる(確信度0.85以上。読み込めなくても保存は進む)
+    if (!it && !S.date && autoExp() && !(ex && ex.expiry && ex.qty > 0)) {
+      const pi = { name, category: v.category, sub: v.sub, location: v.location }, r = SL ? predictNow(pi) : await predictSafe(pi);
+      if (r) { Object.assign(S, { date: r.date, kind: r.kind, src: '予測', from: todayStr() }); auto = r; }
+    }
+    if (ex) { // 同名の品は数量を足す(場所・分類は変えない)。期限は、この画面で入れた/自動で入れたときだけ更新する
+      const next = { ...ex, qty: ex.qty + qty };
+      if (S.date) { if (S.src === '手入力' || S.src === '写真') xsJudge(ex, S.date); putExpiry(next, S); }
+      saveQty(ex, next).catch(() => {}); if (auto) undo = () => save(ex);
+    } else {
+      const rec = { ...x, name, qty, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, category: v.category, location: v.location };
+      putExpiry(rec, S);
+      if (it && estSrc(it.expirySrc)) { if (S.confirmed) xsJudge(it, null); else if (S.date && (S.src === '手入力' || S.src === '写真')) xsJudge(it, S.date); } // 予測の的中率の記録
       if (v.sub) rec.sub = v.sub; else delete rec.sub;
       if (v.auto) rec.auto = true; else delete rec.auto; // 自動の候補をそのまま使った場合だけ「自動」の印(手で選んだ値・追加先の値には付けない)
+      if (!it && auto) rec.id = newId();
       saveQty(it || null, rec).catch(() => {}); // 送信は待たない(オフラインでも閉じる)。失敗は toast で知らせる
-      wh = rec.location;
+      wh = rec.location; if (!it && auto) undo = () => store.remove(rec.id);
     }
-    toast(it ? `「${name}」を保存しました` : ex ? `「${name}」に ${qty} 足しました${ex.location ? `(${canonLocation(ex.location, ex.name)})` : ''}` : `「${name}」を${wh ? `${wh}に` : ''}追加しました`);
+    const note = auto ? `(期限は予測 ${dateJa(auto.date)})` : '';
+    toast((it ? `「${name}」を保存しました` : ex ? `「${name}」に ${qty} 足しました${ex.location ? `(${canonLocation(ex.location, ex.name)})` : ''}` : `「${name}」を${wh ? `${wh}に` : ''}追加しました`) + note, undo);
+    busy = false;
     if (again) { editDialog(); $('#f-n').focus(); } else d.close();
   };
   $('#f-form').onsubmit = (e) => { e.preventDefault(); submit(false); };
