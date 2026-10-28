@@ -3,7 +3,7 @@ import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
 import { ocr, warmupOcr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
 import { scan, lookupName } from './barcode.js';
-import { CATS, LOCS, LEGACY_CATEGORY, canonCategory, canonLocation, catInfo, locInfo, categoryOptions, locationOptions } from './taxonomy.js';
+import { CATS, LOCS, LEGACY_CATEGORY, canonCategory, canonLocation, catInfo, locInfo, categoryOptions, subOptions, locationOptions } from './taxonomy.js';
 import { guessClass } from './category.js';
 import { plan, daysLeft, expiryDays, withLog, autoClassify, EXPIRY_DAYS, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
 
@@ -31,13 +31,6 @@ const save = (rec) => store.save(rec).catch((e) => { toast(`保存できませ�
 const isLow = (i) => i.minQty > 0 && i.qty <= i.minQty;
 // 数量が変わる保存はすべてここを通す(使用履歴 log を追記)。old=null は新規。opts.skip: 処分など消費ではない変更
 const saveQty = (old, next, opts) => save(withLog(old, next, Date.now(), opts));
-// category/location が空なら自動分類で補う(ユーザーが選んだ値は上書きしない)。補ったら auto:true
-const fillAuto = (rec) => {
-  if (rec.category && rec.location) return rec;
-  const r = autoClassify(rec, items, { locs: locationOptions(items) });
-  const out = { ...rec, category: rec.category || r.category, location: rec.location || r.location, ...(r.sub && !rec.sub ? { sub: r.sub } : {}) };
-  return out.category !== (rec.category || '') || out.location !== (rec.location || '') ? { ...out, auto: true } : out;
-};
 // 「今はしない」の記録(端末内のみ。60日たつと再評価される)
 const DKEY = 'hs-dismiss', DISMISS_MS = 60 * 864e5;
 const dismissed = () => { try { const o = JSON.parse(localStorage.getItem(DKEY)) || {}, n = Date.now(); return Object.fromEntries(Object.entries(o).filter(([, t]) => n - t < DISMISS_MS)); } catch { return {}; } };
@@ -64,6 +57,117 @@ try {
   for (const k of ['cat', 'loc']) if (Array.isArray(o?.[k])) foldS[k] = new Set(o[k].filter((x) => typeof x === 'string'));
 } catch {}
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+
+// ---------- 追加先(連続して追加するあいだ保つ、置き場所と分類) ----------
+// 選んだ項目だけが新しい品の初期値になる(選ばなかった項目は自動分類)。優先: 品目ごとに手で選んだ値 > 追加先 > 自動分類
+// 「固定」をオンにしたときだけ、ダイアログを閉じても次の追加へ引き継ぐ(端末ごと: hs-addctx)。オフなら閉じると「おまかせ」に戻る
+const ACKEY = 'hs-addctx';
+const trim = (v) => (typeof v === 'string' ? v.trim() : '');
+const ctxNorm = (o) => { const category = trim(o?.category), location = trim(o?.location); return { location, category, sub: category ? trim(o?.sub) : '', sticky: !!(o?.sticky && (location || category)) }; };
+let addCtx = ctxNorm({}), ctxHook = null; // ctxHook: いま開いている追加画面が、追加先の変更を受け取る関数
+try { const o = JSON.parse(localStorage.getItem(ACKEY)); if (o?.sticky === true) addCtx = ctxNorm(o); } catch {}
+const ctxEmpty = () => !addCtx.location && !addCtx.category;
+function setCtx(patch) {
+  addCtx = ctxNorm({ ...addCtx, ...patch });
+  try { addCtx.sticky ? localStorage.setItem(ACKEY, JSON.stringify(addCtx)) : localStorage.removeItem(ACKEY); } catch {}
+  renderBars(); ctxHook?.();
+}
+// 追加の画面を閉じたとき: 固定でなければ「おまかせ」に戻す
+function endCtx() { ctxHook = null; if (!addCtx.sticky && !ctxEmpty()) setCtx({ location: '', category: '', sub: '' }); else renderBars(); }
+// 追加先バー(各画面の上に置く)。押すと選択シート。場所・分類のボタンがそのまま「変更」ボタン
+const acbInner = () => {
+  const { location: l, category: c, sub: s, sticky } = addCtx, empty = ctxEmpty();
+  const lt = l ? `${locInfo(l).icon} ${esc(l)}` : empty ? '📍 場所を選ぶ' : '📍 場所: おまかせ', ct = c ? `${catInfo(c).icon} ${esc(c)}${s ? ` / ${esc(s)}` : ''}` : empty ? '🏷️ 分類を選ぶ' : '🏷️ 分類: おまかせ';
+  const stk = empty ? '' : `<button type="button" class="ab${sticky ? ' lock' : ''}" data-ac="sticky" aria-label="${sticky ? '追加先の固定をはずす(いまは固定中)' : '追加先を固定する(閉じても次の追加へ引き継ぎます)'}">${sticky ? '🔒 固定をはずす' : '🔓 固定する'}</button>`;
+  return `<div class="ach"><span class="acl">追加先${empty ? ': <b>おまかせ</b>(自動で分類)' : ''}</span>${stk}</div><div class="acr">`
+    + `<button type="button" class="ab${l ? ' set' : ''}" data-ac="loc" aria-haspopup="dialog" aria-label="置き場所を選ぶ(いま: ${l ? esc(l) : 'おまかせ'})">${lt} <span aria-hidden="true">▾</span></button>`
+    + `<button type="button" class="ab${c ? ' set' : ''}" data-ac="cat" aria-haspopup="dialog" aria-label="分類を選ぶ(いま: ${c ? esc(c + (s ? ` / ${s}` : '')) : 'おまかせ'})">${ct} <span aria-hidden="true">▾</span></button></div>`;
+};
+const acb = () => `<div class="acb${ctxEmpty() ? '' : ' on'}" role="group" aria-label="追加先">${acbInner()}</div>`;
+function renderBars() {
+  const h = acbInner();
+  document.querySelectorAll('.acb').forEach((e) => { if (e.innerHTML !== h) e.innerHTML = h; e.classList.toggle('on', !ctxEmpty()); });
+  const n = $('#addnav'); if (n) n.setAttribute('aria-label', addCtx.sticky ? `品目を追加(追加先 ${[addCtx.location, addCtx.category].filter(Boolean).join('・')} に固定中)` : '品目を追加');
+}
+const inDlg = (sel) => (dlg.open ? dlg : document).querySelector(sel);
+document.addEventListener('click', (e) => {
+  const b = e.target.closest?.('.acb [data-ac]'); if (!b) return;
+  const k = b.dataset.ac;
+  if (k === 'sticky') { setCtx({ sticky: !addCtx.sticky }); inDlg('.acb [data-ac="sticky"]')?.focus({ preventScroll: true }); } else ctxSheet(k);
+});
+// 追加先を選ぶシート(置き場所 / 大分類→小分類)。大きなボタンで1タップ。選ぶと閉じる
+let sheetFrom = '';
+function ctxSheet(kind) {
+  let s = $('#acs');
+  if (!s) {
+    s = document.createElement('dialog'); s.id = 'acs'; s.setAttribute('aria-labelledby', 'acs-h'); document.body.append(s);
+    s.addEventListener('close', () => inDlg(`.acb [data-ac="${sheetFrom}"]`)?.focus?.({ preventScroll: true }));
+    s.addEventListener('click', (e) => { if (e.target !== s) return; const r = s.getBoundingClientRect(); if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) s.close(); });
+  }
+  sheetFrom = kind; let stage = '', pick = '';
+  const chip = (v, label, on, a = 'data-v') => `<button type="button" class="chip" ${a}="${esc(v)}" aria-pressed="${on}">${label}</button>`;
+  const note = '<p class="sub">「固定」にすると、閉じても次の追加へ引き継ぎます。</p><button type="button" class="b" data-x style="width:100%">閉じる</button>';
+  const draw = () => {
+    if (kind === 'loc') {
+      const cur = addCtx.location, ls = locationOptions(items); if (cur && !ls.includes(cur)) ls.push(cur);
+      s.innerHTML = `<h3 id="acs-h" tabindex="-1">置き場所を選ぶ</h3><p class="sub">選んだ場所に、これから追加する品が入ります。</p>
+        <div class="chips" role="group" aria-label="置き場所">${chip('', '✨ おまかせ', !cur)}${ls.map((l) => chip(l, `${locInfo(l).icon} ${esc(l)}`, l === cur)).join('')}</div>
+        <label for="acs-t">ほかの場所(自由に入力)</label><div class="row"><input id="acs-t" enterkeyhint="done" placeholder="例: 物置" autocomplete="off"><button type="button" class="b" id="acs-ok">決定</button></div>${note}`;
+    } else if (stage === 'sub') {
+      const cur = addCtx.category === pick ? addCtx.sub : '', ss = subOptions(pick, items), ci = catInfo(pick);
+      s.innerHTML = `<h3 id="acs-h" tabindex="-1">${ci.icon} ${esc(pick)}の小分類</h3><p class="sub">小分類まで決めると、品がその分類に入ります。</p>
+        <div class="chips" role="group" aria-label="小分類">${chip('', '小分類は決めない', !cur, 'data-s')}${ss.map((x) => chip(x, esc(x), x === cur, 'data-s')).join('')}</div>
+        <button type="button" class="b" data-back style="width:100%;margin:8px 0">← 大分類にもどる</button>${note}`;
+    } else {
+      const cur = addCtx.category, cs = categoryOptions(items); if (cur && !cs.includes(cur)) cs.push(cur);
+      s.innerHTML = `<h3 id="acs-h" tabindex="-1">分類を選ぶ</h3><p class="sub">大分類を選ぶと、小分類も選べます。</p>
+        <div class="chips" role="group" aria-label="大分類">${chip('', '✨ おまかせ', !cur)}${cs.map((c) => chip(c, `${catInfo(c).icon} ${esc(c)}`, c === cur)).join('')}</div>${note}`;
+    }
+    const f = s.querySelector('#acs-h'); if (f) f.focus({ preventScroll: true });
+  };
+  s.onclick = (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.x !== undefined) return s.close();
+    if (b.dataset.back !== undefined) { stage = ''; return draw(); }
+    if (b.id === 'acs-ok') { const v = trim($('#acs-t').value); if (!v) return $('#acs-t').focus(); setCtx({ location: v }); return s.close(); }
+    if (b.dataset.s !== undefined) { setCtx({ category: pick, sub: b.dataset.s }); return s.close(); }
+    if (b.dataset.v === undefined) return;
+    const v = b.dataset.v;
+    if (kind === 'loc') { setCtx({ location: v }); return s.close(); }
+    if (v && subOptions(v, items).length) { pick = v; stage = 'sub'; return draw(); } // 小分類がある大分類は、続けて小分類を選ぶ
+    setCtx({ category: v, sub: '' }); s.close();
+  };
+  s.onkeydown = (e) => { if (e.key === 'Enter' && e.target.id === 'acs-t') { e.preventDefault(); $('#acs-ok').click(); } };
+  draw(); s.showModal();
+}
+// カテゴリ・小分類・置き場所の3つの欄(editDialog と barcodeForm で共通)。値の優先: 手で選んだ値 > 追加先 > 自動分類
+// init: 保存済みの値(あれば手で選んだ扱い)。useCtx: 追加先を使うか(新規だけ)。src: 'hand'|'ctx'|'auto'|''(各欄の値の出どころ)
+function classForm({ fC, fS, fL, getName, id, init = {}, useCtx, onChange }) {
+  const pin = { c: !!init.category, l: !!init.location }; pin.s = pin.c || !!init.sub;
+  const src = { c: pin.c ? (init.auto ? 'auto' : 'hand') : '', s: '', l: pin.l ? (init.auto ? 'auto' : 'hand') : '' }, touched = { c: false, s: false, l: false };
+  const fill = (sel, list, v) => { const a = !v || list.includes(v) ? list : [...list, v], h = '<option value="">未設定</option>' + a.map((x) => `<option>${esc(x)}</option>`).join(''); if (sel.dataset.k !== h) { sel.innerHTML = h; sel.dataset.k = h; } sel.value = v || ''; };
+  fill(fC, categoryOptions(items), init.category || ''); fill(fS, subOptions(init.category || '', items), init.sub || ''); fill(fL, locationOptions(items), init.location || '');
+  const recompute = () => {
+    const x = useCtx ? addCtx : {}, catX = pin.c ? fC.value : x.category || '', subX = pin.s ? fS.value : !pin.c && x.category ? x.sub || '' : '', locX = pin.l ? fL.value : x.location || '';
+    const r = autoClassify({ id, name: getName(), category: catX, sub: subX, location: locX }, items, { locs: locationOptions(items) });
+    const cat = pin.c ? catX : catX || r.category, sub = pin.s ? subX : subX || r.sub, loc = pin.l ? locX : locX || r.location;
+    if (!pin.c) src.c = catX ? 'ctx' : cat ? 'auto' : '';
+    if (!pin.s) src.s = subX ? 'ctx' : sub ? 'auto' : '';
+    if (!pin.l) src.l = locX ? 'ctx' : loc ? 'auto' : '';
+    fill(fC, categoryOptions(items), cat); fill(fS, subOptions(cat, items), sub); fill(fL, locationOptions(items), loc);
+    onChange?.();
+  };
+  const hand = (k) => { touched[k] = true; pin[k] = true; src[k] = 'hand'; if (init.auto) src.c = src.l = 'hand'; };
+  fC.onchange = () => { hand('c'); pin.s = false; recompute(); }; // 大分類を変えたら小分類はクリア(自動の候補だけが入る)
+  fS.onchange = () => { pin.c = true; hand('s'); recompute(); };
+  fL.onchange = () => { hand('l'); recompute(); };
+  const values = () => ({ category: fC.value, sub: fS.value, location: fL.value, auto: !!((src.c === 'auto' && fC.value) || (src.l === 'auto' && fL.value)), touched, src: { ...src } });
+  const hint = () => {
+    const by = (s) => [[fC.value, 'c'], [fS.value, 's'], [fL.value, 'l']].filter(([v, k]) => v && src[k] === s).map(([v]) => v);
+    return [by('ctx').length && `追加先の指定: ${by('ctx').join(' / ')}`, by('auto').length && `自動の候補: ${by('auto').join(' / ')}(変更できます)`].filter(Boolean).join(' ・ ');
+  };
+  return { recompute, values, hint };
+}
 // 検索用: ひらがな/カタカナ・全角半角・大文字小文字・空白と「・」の違いを無視する(長音や小書き文字は変えない)
 const fold = (s) => String(s ?? '').normalize('NFKC').toLowerCase().replace(/[ぁ-ゖ]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 96)).replace(/[\s・]+/g, '');
 // 2026-10-26 → 10月26日(年が違うときだけ年つき)
@@ -144,7 +248,7 @@ function groupByCat(list, held) {
   const out = [];
   for (const k of [...order, ...extra, '']) {
     const a = by.get(k); if (!a) continue;
-    const ci = k ? catInfo(k) : UNCAT, g = { key: k || UNCAT.name, name: ci.name || UNCAT.name, icon: ci.icon, color: ci.color, items: a, hint: k ? '' : '分類をつけると探しやすくなります。品名をタップして編集できます。' };
+    const ci = k ? catInfo(k) : UNCAT, g = { key: k || UNCAT.name, name: ci.name || UNCAT.name, icon: ci.icon, color: ci.color, items: a, none: !k, hint: k ? '' : '分類をつけると探しやすくなります。品名をタップして編集できます。' };
     if (ci.subs?.length) {
       const names = [...ci.subs, ...new Set(a.map((x) => x.sub).filter((s) => s && !ci.subs.includes(s)))];
       let subs = names.map((n) => [n, a.filter((x) => (x.sub || 'その他') === n)]).filter(([, arr]) => arr.length);
@@ -169,7 +273,7 @@ function groupByLoc(list) {
   for (const k of [...LOCS, ...extra, '']) {
     const a = by.get(k); if (!a) continue;
     const li = k ? locInfo(k) : NOLOC;
-    out.push({ key: li.name, name: li.name, icon: li.icon, place: true, items: a, hint: k ? '' : '置き場所をつけると、冷蔵庫など場所ごとに見られます。' });
+    out.push({ key: li.name, name: li.name, icon: li.icon, place: true, none: !k, items: a, hint: k ? '' : '置き場所をつけると、冷蔵庫など場所ごとに見られます。' });
   }
   return out;
 }
@@ -177,7 +281,8 @@ function groupHtml(g, n, ctx, closed) {
   const nl = g.items.filter((x) => x.low).length, ne = g.items.filter((x) => x.near).length, id = `g-${ctx}-${n}`, shut = closed.has(g.key);
   const colors = g.place ? '--gbg:var(--place-bg);--gfg:var(--place-fg)' : `--gbg:var(--c-${g.color}-bg);--gfg:var(--c-${g.color}-fg)`;
   const body = g.subs ? g.subs.map(([sn, arr]) => `<h4 class="sh">${esc(sn)}<span>${arr.length}品</span></h4>${arr.map((x) => rowHtml(x, ctx)).join('')}`).join('') : g.items.map((x) => rowHtml(x, ctx)).join('');
-  return `<section class="lg" style="${colors}"><h3 class="gh"><button data-fold="${esc(g.key)}" aria-expanded="${!shut}" aria-controls="${id}"><span class="ic" aria-hidden="true">${g.icon}</span><span class="gn">${esc(g.name)}<span class="ct">${g.items.length}品</span></span><span class="gr"><span class="bdg">${nl ? `<span class="hb low">足りない ${nl}</span>` : ''}${ne ? `<span class="hb exp">期限 ${ne}</span>` : ''}</span><span class="chev" aria-hidden="true">${CHEV}</span></span></button></h3>`
+  const add = g.none ? '' : `<button type="button" class="gadd" data-gadd="${esc(g.key)}" aria-label="${esc(g.name)}に品を追加"><span aria-hidden="true">＋</span><span class="gat">追加</span></button>`;
+  return `<section class="lg" style="${colors}"><div class="gw"><h3 class="gh"><button data-fold="${esc(g.key)}" aria-expanded="${!shut}" aria-controls="${id}"><span class="ic" aria-hidden="true">${g.icon}</span><span class="gn">${esc(g.name)}<span class="ct">${g.items.length}品</span></span><span class="gr"><span class="bdg">${nl ? `<span class="hb low">足りない ${nl}</span>` : ''}${ne ? `<span class="hb exp">期限 ${ne}</span>` : ''}</span><span class="chev" aria-hidden="true">${CHEV}</span></span></button></h3>${add}</div>`
     + `<div class="gbody" id="${id}" ${shut ? 'hidden' : ''}>${g.hint ? `<p class="gnote">${g.hint}</p>` : ''}${body}</div></section>`;
 }
 
@@ -211,6 +316,9 @@ function renderStock(v) {
   $('#scan').onclick = barcodeAdd;
   $('#lst').onclick = (e) => {
     const t = e.target.closest('button'); if (!t) return;
+    if (t.dataset.gadd !== undefined) { // 見出しの＋: その場所/分類を追加先にして、追加ダイアログを開く(固定中なら固定のまま)
+      setCtx(viewMode === 'loc' ? { location: t.dataset.gadd, category: '', sub: '' } : { category: t.dataset.gadd, sub: '', location: '' }); return editDialog();
+    }
     if (t.dataset.fold !== undefined) { setOpen(t, t.getAttribute('aria-expanded') !== 'true'); saveFold(); syncFoldBtn(); return; }
     if (t.dataset.clear !== undefined) return clearAll();
     const row = t.closest('.it'), it = row && idMap.get(row.dataset.id); if (!it) return;
@@ -403,7 +511,7 @@ function renderFamily(v) {
 }
 
 function renderImport(v) {
-  v.innerHTML = `<h2>まとめて追加</h2><div class="card"><h3>バーコードで追加</h3><p class="sub">商品のバーコードをカメラで読むだけで追加できます。一度登録した商品は、次から数量が増えます。家族にも共有されます。</p><button class="b p" id="bc">バーコードを読む</button></div>
+  v.innerHTML = `<h2>まとめて追加</h2>${acb()}<p class="sub" style="margin:0">追加先を選ぶと、バーコード・レシート・貼り付けの品がその場所・分類に入ります(選ばない項目は自動で分類)。</p><div class="card"><h3>バーコードで追加</h3><p class="sub">商品のバーコードをカメラで読むだけで追加できます。一度登録した商品は、次から数量が増えます。家族にも共有されます。</p><button class="b p" id="bc">バーコードを読む</button></div>
   <div class="card"><h3>レシートを撮って追加</h3><p class="sub">端末の中で文字を読み取ります(画像は送信されません)。読み間違いは、写真を見ながら直してから登録します。</p>
   <div class="sub" id="mdl"></div><ul class="tips"><li>明るい場所で撮る</li><li>レシートを平らにして、真上から撮る</li><li>自分の影が入らないようにする</li></ul>
   <div class="row"><label class="b p filebtn grow">カメラで撮る<input type="file" id="rcc" accept="image/*" capture="environment" class="vh"></label><label class="b filebtn grow">アルバムから選ぶ<input type="file" id="rc" accept="image/*" multiple class="vh"></label></div><div id="rcs"></div></div>
@@ -622,6 +730,28 @@ function openViewer(url) {
   v.showModal();
 }
 
+// 取り込み確認の1行の、場所・分類(手で選んだ値 c.uc/c.us/c.ul > 追加先 > 自動)。出どころ src: hand|ctx|auto
+const rvOpen = new WeakSet(); // 「置き場所・小分類」を開いている行(再描画しても開いたまま)
+const withCur = (list, v) => (!v || list.includes(v) ? list : [...list, v]);
+const selOpts = (arr, v) => `<option value="">未設定</option>${arr.map((x) => `<option ${x === v ? 'selected' : ''}>${esc(x)}</option>`).join('')}`;
+function rowEff(c) {
+  const x = addCtx;
+  let cat, catSrc, sub = '', subSrc = '';
+  if (c.uc) { cat = c.category || ''; catSrc = 'hand'; }
+  else if (x.category) { cat = x.category; catSrc = 'ctx'; }
+  else { cat = c.category || ''; catSrc = cat ? (c.auto === false ? 'hand' : 'auto') : ''; }
+  if (c.us) { sub = c.sub || ''; subSrc = 'hand'; }
+  else if (!c.uc && x.category && x.sub) { sub = x.sub; subSrc = 'ctx'; }
+  else if (!c.uc && !x.category && c.sub) { sub = c.sub; subSrc = 'auto'; }
+  const loc0 = c.ul ? '' : x.location || '';
+  const r = autoClassify({ name: c.name || '', category: cat, sub, location: loc0 }, items, { locs: locationOptions(items) });
+  if (!cat && r.category) { cat = r.category; catSrc = 'auto'; }
+  if (!sub && !c.us && cat && r.sub) { sub = r.sub; subSrc = 'auto'; }
+  const location = c.ul ? c.location || '' : loc0 || r.location, locSrc = c.ul ? 'hand' : loc0 ? 'ctx' : location ? 'auto' : '';
+  return { category: cat, sub, location, catSrc, subSrc, locSrc, auto: !!((catSrc === 'auto' && cat) || (locSrc === 'auto' && location)) };
+}
+const rcText = (e) => `<span>場所・小分類:</span> <b>${e.location ? `${locInfo(e.location).icon} ${esc(e.location)}` : '置き場所なし'}</b>${e.locSrc === 'ctx' ? '(追加先)' : e.locSrc === 'auto' ? '(自動)' : ''} ・ <b>${e.sub ? esc(e.sub) : '小分類なし'}</b>`;
+
 function reviewDialog() {
   const d = $('#dlg'), st = d.scrollTop, pvOld = d.querySelector('.phv'), pvPos = pvOld ? [pvOld.scrollLeft, pvOld.scrollTop] : null;
   delete d.dataset.cf;
@@ -636,10 +766,14 @@ function reviewDialog() {
     return nm || pr ? { nm, pr } : null;
   };
   if (ph.open === null) ph.open = hasPh && (receipts.some((r) => r.note) ? innerHeight >= 500 : innerHeight >= 700 && draft.some((c) => flagsOf(c))); // 低い画面では写真を最初はしまっておく(編集欄が狭くなるため)
-  const row = (c, n) => `<div class="card rv" data-row="${n}"><div class="fl" data-fl="${n}"></div><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" list="rv-names" autocomplete="off" autocorrect="off" enterkeyhint="next" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
-    <div class="rv2"><div><label>カテゴリ</label><select data-ct="${n}"><option value="">未設定</option>${CATS.map((x) => `<option ${x === c.category ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+  const row = (c, n) => {
+    const e = rowEff(c), lo = locationOptions(items);
+    return `<div class="card rv" data-row="${n}"><div class="fl" data-fl="${n}"></div><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" list="rv-names" autocomplete="off" autocorrect="off" enterkeyhint="next" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
+    <div class="rv2"><div><label>カテゴリ</label><select data-ct="${n}">${selOpts(withCur(categoryOptions(items), e.category), e.category)}</select></div>
     <div><label>数量</label><input data-q="${n}" type="number" inputmode="numeric" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" inputmode="numeric" enterkeyhint="next" min="0" value="${c.price || ''}"></div></div>
-    <div class="sub">${c.fix ? `<span class="fixd" data-fx="${n}">前回の修正を適用</span> ・ ` : ''}${c.auto && c.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : ''}${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}${c.gap ? ' ・ 検算用(在庫には登録しません)' : ''}</div></div>`;
+    <details class="rvc" data-rc="${n}" ${rvOpen.has(c) ? 'open' : ''}><summary data-rcs="${n}">${rcText(e)}</summary><div class="grid2"><div><label>小分類</label><select data-sb="${n}">${selOpts(withCur(subOptions(e.category, items), e.sub), e.sub)}</select></div><div><label>置き場所</label><select data-lc="${n}">${selOpts(withCur(lo, e.location), e.location)}</select></div></div></details>
+    <div class="sub">${c.fix ? `<span class="fixd" data-fx="${n}">前回の修正を適用</span> ・ ` : ''}<span data-bg="${n}">${e.catSrc === 'auto' && e.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : e.catSrc === 'ctx' ? '<span class="auto">追加先</span> ' : ''}</span>${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}${c.gap ? ' ・ 検算用(在庫には登録しません)' : ''}</div></div>`;
+  };
   const smTxt = (r) => `店名・日付: ${r.store || '(なし)'} ・ ${r.date ? dateJa(r.date) : '(日付なし)'}(タップで直す)`;
   const add = (rid) => `<button type="button" class="b" data-add="${rid ?? ''}" style="width:100%">＋ 品目を追加${multi ? `(${rid + 1}枚目)` : ''}</button>`;
   const head = (r, n) => `<div class="card rc"><div class="rh">${r.photo ? `<button type="button" class="th" data-pv="${n}" aria-label="${multi ? `${n + 1}枚目の` : ''}レシートの写真を全画面で見る"><img src="${r.photo}" alt=""></button>` : ''}<div class="grow"><div class="rt">レシート${multi ? ` ${n + 1}枚目` : ''}</div>${r.note ? `<div class="note"><span aria-hidden="true">⚠ </span>${esc(r.note)}</div>` : ''}${r.photo ? '<div class="sub">写真をタップすると大きく見られます</div>' : ''}</div></div>
@@ -653,7 +787,7 @@ function reviewDialog() {
   d.innerHTML = `<div class="phbar" id="phbar"><div class="row">${hasPh ? `<button type="button" class="b grow" id="phtg" aria-expanded="${ph.open}" aria-controls="phpn">📷 写真を${ph.open ? 'しまう' : '見ながら直す'}</button>` : ''}<button type="button" class="b grow" id="jump" hidden></button></div>
   ${hasPh ? `<div id="phpn" ${ph.open ? '' : 'hidden'}><div class="phw"><div class="phc">${phSel}<button type="button" class="b" data-zm="-1" aria-label="写真を小さくする">－</button><button type="button" class="b" data-zm="1" aria-label="写真を大きくする">＋</button><button type="button" class="b" id="phfs">全画面</button></div>
   <div class="phv" tabindex="0" role="region" aria-label="レシートの写真(指でなぞると動かせます)"><img id="phimg" src="${receipts[ph.sel].photo}" alt="レシートの写真" style="width:${ph.zoom}%"></div></div></div>` : ''}</div>
-  <h3 id="dlg-h" tabindex="-1" autofocus>${manual ? '写真を見ながら入力してください' : 'この内容で登録しますか?'}</h3><p class="sub">${manual ? '名前と金額を入れてください。次の欄へは「次へ」キーで進めます。' : '黄色の行は読み間違いかもしれません。写真を見て、名前・数量・金額を直せます。'}同じ名前が在庫にあれば数量を足します。</p>
+  <h3 id="dlg-h" tabindex="-1" autofocus>${manual ? '写真を見ながら入力してください' : 'この内容で登録しますか?'}</h3>${acb()}${ctxEmpty() ? '' : '<button type="button" class="b wide" id="acall">手で変えた行も、追加先にそろえる</button>'}<p class="sub">${manual ? '名前と金額を入れてください。次の欄へは「次へ」キーで進めます。' : '黄色の行は読み間違いかもしれません。写真を見て、名前・数量・金額を直せます。'}同じ名前が在庫にあれば数量を足します。</p>
   <datalist id="rv-names">${names.map((x) => `<option value="${esc(x)}">`).join('')}</datalist>
   ${receipts.map(head).join('')}${draft.some((c) => c.rid === undefined) ? draft.map((c, i) => (c.rid === undefined ? row(c, i) : '')).join('') + add(undefined) : ''}
   ${receipts.length ? `<div class="row" style="margin-top:8px"><label class="b grow filebtn">写真を撮って追加<input type="file" id="more-cam" accept="image/*" capture="environment" class="vh"></label><label class="b grow filebtn">アルバムから追加<input type="file" id="more" accept="image/*" multiple class="vh"></label></div>` : ''}
@@ -701,11 +835,26 @@ function reviewDialog() {
   d.querySelectorAll('[data-nm]').forEach((e) => {
     const n = +e.dataset.nm;
     e.oninput = () => { const c = draft[n]; c.name = e.value; if (c.fix) { c.fix = false; d.querySelector(`[data-fx="${n}"]`)?.remove(); } cnt(); refreshFlags(); };
-    e.onchange = () => { draft[n].checked = true; refreshFlags(); }; // 手で直したら確認済み
+    e.onchange = () => { draft[n].checked = true; refreshFlags(); syncRow(n); }; // 手で直したら確認済み(名前が変わると自動の場所も変わる)
     e.onfocus = () => { if (!flagsOf(draft[n])?.nm) return; const v = e.value; e.select(); setTimeout(() => e.value === v && e.select(), 0); }; // 崩れた名前は全選択 → そのまま打てば置き換わる/候補が出る
     e.onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); const nx = flagged().find((i) => i > n); (nx === undefined ? d.querySelector(`[data-pr="${n}"]`) : d.querySelector(`[data-nm="${nx}"]`)).focus(); } }; // 次へ: 要確認の行が続くならそこへ(金額は合っていることが多い)
   });
-  d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { draft[e.dataset.ct].category = e.value; delete draft[e.dataset.ct].sub; draft[e.dataset.ct].auto = false; e.closest('.rv').querySelector('.auto')?.remove(); }));
+  // 行の場所・分類の表示を、いまの値(手で選んだ値 > 追加先 > 自動)に合わせ直す
+  const syncRow = (n) => {
+    const c = draft[n], card = d.querySelector(`[data-row="${n}"]`); if (!card) return;
+    const e = rowEff(c), set = (sel, arr, v) => { sel.innerHTML = selOpts(withCur(arr, v), v); };
+    set(card.querySelector('[data-ct]'), categoryOptions(items), e.category); set(card.querySelector('[data-sb]'), subOptions(e.category, items), e.sub); set(card.querySelector('[data-lc]'), locationOptions(items), e.location);
+    card.querySelector('[data-rcs]').innerHTML = rcText(e);
+    card.querySelector('[data-bg]').innerHTML = e.catSrc === 'auto' && e.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : e.catSrc === 'ctx' ? '<span class="auto">追加先</span> ' : '';
+  };
+  d.querySelectorAll('[data-ct]').forEach((e) => (e.onchange = () => { const c = draft[e.dataset.ct]; c.category = e.value; c.uc = true; c.us = false; delete c.sub; c.auto = false; syncRow(+e.dataset.ct); })); // 大分類を変えたら小分類はクリア
+  d.querySelectorAll('[data-sb]').forEach((e) => (e.onchange = () => { const c = draft[e.dataset.sb], f = rowEff(c); c.category = f.category; c.uc = true; c.auto = false; c.us = true; if (e.value) c.sub = e.value; else delete c.sub; syncRow(+e.dataset.sb); }));
+  d.querySelectorAll('[data-lc]').forEach((e) => (e.onchange = () => { const c = draft[e.dataset.lc]; c.ul = true; c.location = e.value; syncRow(+e.dataset.lc); }));
+  d.querySelectorAll('[data-rc]').forEach((e) => (e.ontoggle = () => { const c = draft[e.dataset.rc]; if (c) e.open ? rvOpen.add(c) : rvOpen.delete(c); }));
+  $('#acall')?.addEventListener('click', () => { // 手で変えた行も追加先に合わせる(追加先で選んだ項目だけ)
+    for (const c of draft) { if (addCtx.category) { c.uc = c.us = false; } if (addCtx.location) c.ul = false; }
+    reviewDialog(); toast('すべての行を追加先にそろえました');
+  });
   d.querySelectorAll('[data-q]').forEach((e) => (e.oninput = () => (draft[e.dataset.q].qty = Math.max(1, +e.value || 1))));
   d.querySelectorAll('[data-pr]').forEach((e) => {
     const n = +e.dataset.pr;
@@ -740,20 +889,26 @@ function reviewDialog() {
   $('#ok').onclick = () => {
     if (flagged().length && !d.dataset.cf) { d.dataset.cf = '1'; refreshFlags(); cnt(); $('#cf-j').focus(); return; } // 強調が残っていれば一度だけ確認(止めはしない)
     const byName = new Map(items.map((i) => [norm(i.name), i]));
-    let n = 0;
+    let n = 0; const wheres = new Set();
     fixLearn(draft.filter((c) => c.on && c.name.trim() && c.ocrName && fixKey(c.ocrName) && fixKey(c.name) !== fixKey(c.ocrName) && !known.has(norm(c.ocrName))).map((c) => [fixKey(c.ocrName), c.name.trim()])); // 崩れ→直した名前を学習(端末内のみ)
     for (const c of draft.filter((x) => x.on && x.name.trim())) {
-      const ex = byName.get(norm(c.name));
+      const ex = byName.get(norm(c.name)), e = rowEff(c); // e: 手で選んだ値 > 追加先 > 自動
       const keys = c.srcKey ? [c.srcKey] : [];
-      let rec = ex ? { ...ex, qty: ex.qty + c.qty, category: ex.category || c.category || '', ...(!ex.category && !ex.sub && c.sub ? { sub: c.sub } : {}), boughtAt: c.boughtAt || ex.boughtAt || '', srcKeys: [...(ex.srcKeys || []), ...keys] }
-        : { name: c.name.trim(), qty: c.qty, category: c.category || '', ...(c.sub ? { sub: c.sub } : {}), location: '', minQty: 0, buyQty: 1, price: c.price || 0, boughtAt: c.boughtAt || '', source: c.source, srcKeys: keys };
-      rec = fillAuto(rec); if (c.auto && c.category && !ex?.category) rec.auto = true;
+      let rec;
+      if (ex) { // 同名の品は数量を足すだけ。場所・分類は、空のときだけ補う(上書きしない)
+        rec = { ...ex, qty: ex.qty + c.qty, boughtAt: c.boughtAt || ex.boughtAt || '', srcKeys: [...(ex.srcKeys || []), ...keys] };
+        let au = false;
+        if (!ex.category && e.category) { rec.category = e.category; if (!ex.sub && e.sub) rec.sub = e.sub; au = e.catSrc === 'auto'; }
+        if (!ex.location && e.location) { rec.location = e.location; au = au || e.locSrc === 'auto'; }
+        if (au) rec.auto = true;
+      } else rec = { name: c.name.trim(), qty: c.qty, category: e.category, ...(e.sub ? { sub: e.sub } : {}), location: e.location, minQty: 0, buyQty: 1, price: c.price || 0, boughtAt: c.boughtAt || '', source: c.source, srcKeys: keys, ...(e.auto ? { auto: true } : {}) };
+      if (rec.location) wheres.add(rec.location);
       rec = withLog(ex || null, rec); // 数量の履歴を追記
       save(rec).catch(() => {}); byName.set(norm(c.name), rec); n++; // 送信は待たず、失敗は toast で知らせる
     }
-    d.close(); toast(`${n}件を登録しました`); tab = 'stock'; render();
+    d.close(); toast(`${wheres.size === 1 ? `${[...wheres][0]}に` : ''}${n}件を登録しました`); tab = 'stock'; render();
   };
-  refresh(true); cnt();
+  refresh(true); cnt(); ctxHook = () => reviewDialog(); // 追加先が変わったら、画面を作り直す(手で変えていない行が追加先に変わる)
   const sync = () => d.style.setProperty('--phh', `${$('#phbar').offsetHeight}px`);
   openDlg('review');
   d.scrollTop = st; sync();
@@ -764,7 +919,10 @@ function reviewDialog() {
 async function barcodeAdd() {
   const d = $('#dlg'); openDlg('barcode');
   for (;;) {
-    const sp = scan(d); d.querySelector('h3')?.setAttribute('id', 'dlg-h'); // 番号入力欄で Enter でも決定できるようにする
+    ctxHook = null;
+    const sp = scan(d); d.querySelector('h3')?.setAttribute('id', 'dlg-h');
+    d.querySelector('h3')?.insertAdjacentHTML('afterend', acb()); // 読み取り画面の上に追加先バー(読み取りの部品 barcode.js は変えずに差し込む)
+    // 番号入力欄で Enter でも決定できるようにする
     d.querySelector('#bn')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') d.querySelector('#bg')?.click(); });
     const code = await sp; if (!code) return d.close();
     if (!(await barcodeForm(d, code))) return d.close(); // false=終了 / true=続けて読む
@@ -780,70 +938,76 @@ function barcodeForm(d, code0) {
     catch { toast('読み込みに失敗しました。通信を確認して、もう一度お試しください'); return resolve(false); }
     const code = bc.canonCode(code0); // 12桁(UPC-A)・13桁・UPC-E の表記の違いをそろえる
     const ex = items.find((i) => bc.canonCode(i.barcode) === code);
-    const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
-    d.innerHTML = `<form id="b-form" autocomplete="off"><h3 id="dlg-h">${ex ? '登録済みの商品' : '新しい商品'}</h3><div class="sub">バーコード ${esc(code)}</div>
+    d.innerHTML = `<form id="b-form" autocomplete="off"><h3 id="dlg-h">${ex ? '登録済みの商品' : '新しい商品'}</h3><div class="sub">バーコード ${esc(code)}</div>${acb()}
     <label for="b-n">名前</label><input id="b-n" value="${esc(ex?.name || '')}" placeholder="${ex ? '' : '商品名を検索中…'}">
     <div class="sub" id="b-note" role="status" aria-live="polite" style="margin-top:4px"></div><div id="b-help" hidden></div>
-    <div class="grid2"><div><label>${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" inputmode="numeric" enterkeyhint="done" min="1" value="1"></div>
-    <div><label>カテゴリ</label><select id="b-c">${opts(CATS, ex?.category)}</select></div></div>
+    <div class="grid2"><div><label for="b-q">${ex ? `追加する数(いま ${ex.qty})` : '数量'}</label><input id="b-q" type="number" inputmode="numeric" enterkeyhint="done" min="1" value="1"></div>
+    <div><label for="b-c">カテゴリ</label><select id="b-c"></select></div><div><label for="b-s">小分類</label><select id="b-s"></select></div><div><label for="b-l">置き場所</label><select id="b-l"></select></div></div>
+    <div class="sub" id="b-h" style="margin-top:4px">${ex ? '登録済みの商品なので、置き場所・分類はそのままです(変えるときだけ選びます)。' : ''}</div>
     <div class="btns" style="margin-top:12px"><button type="button" class="b" id="bx">終了</button><button type="submit" class="b p grow" id="bok">${ex ? '数量を追加して次へ' : '登録して次へ'}</button></div></form>`;
-    const n = d.querySelector('#b-n'), c = d.querySelector('#b-c'); let typed = false, stopUi = () => {};
-    n.oninput = () => (typed = true);
-    c.onchange = () => (c.dataset.auto = '');
-    const apply = (name, fromOcr) => { // 検索結果・OCRの候補を名前欄へ。カテゴリは名前から推定(選択済みなら変えない)
-      n.value = name; if (fromOcr) typed = true;
-      if (!c.value || c.dataset.auto) { const g = autoClassify({ name, category: '', location: '' }, items, { locs: LOCS }).category; if (g || c.dataset.auto) { c.value = g; c.dataset.auto = g ? '1' : ''; } }
-    };
+    const n = d.querySelector('#b-n'); let typed = false, stopUi = () => {};
+    // 登録済みの商品は、いまの場所・分類を表示するだけ(追加先は使わない)。新しい商品は 手で選んだ値 > 追加先 > 自動分類
+    const cf = classForm({ fC: d.querySelector('#b-c'), fS: d.querySelector('#b-s'), fL: d.querySelector('#b-l'), getName: () => n.value, id: ex?.id, init: ex ? { category: canonCategory(ex.category, guessClass(ex.name).category), sub: ex.sub, location: canonLocation(ex.location, ex.name), auto: ex.auto } : {}, useCtx: !ex,
+      onChange: () => { if (!ex) d.querySelector('#b-h').textContent = cf.hint(); } });
+    ctxHook = () => cf.recompute();
+    cf.recompute();
+    n.oninput = () => { typed = true; if (!ex) cf.recompute(); };
+    const apply = (name, fromOcr) => { n.value = name; if (fromOcr) typed = true; cf.recompute(); }; // 検索結果・OCRの候補を名前欄へ。分類は 手で選んだ値 > 追加先 > 名前からの推定
     if (!ex) stopUi = ui.mountLookup(d, { code, input: n, apply, isTyped: () => typed });
     d.querySelector('#bx').onclick = () => { stopUi(); resolve(false); };
     d.querySelector('#b-form').onsubmit = (ev) => {
       ev.preventDefault();
       const name = n.value.trim(); if (!name) return toast('名前を入れてください');
       const add = Math.max(1, +d.querySelector('#b-q').value || 1);
-      const same = ex || items.find((i) => norm(i.name) === norm(name));
-      const auto = !!c.dataset.auto && !!c.value;
+      const same = ex || items.find((i) => norm(i.name) === norm(name)), v = cf.values();
       stopUi();
-      (same ? saveQty(same, { ...same, qty: same.qty + add, barcode: code, category: same.category || c.value, ...(auto && !same.category ? { auto: true } : {}) })
-        : saveQty(null, { ...fillAuto({ name, qty: add, category: c.value, location: '', minQty: 0, buyQty: 1, barcode: code, source: 'barcode' }), ...(auto ? { auto: true } : {}) })).catch(() => {});
-      toast(`${name} を追加しました`); resolve(true);
+      let rec;
+      if (same) { // 登録済み・同名の品は数量を足すだけ。場所・分類は、空のときと手で選び直したときだけ入れる(追加先では上書きしない)
+        rec = { ...same, qty: same.qty + add, barcode: code };
+        const catNew = v.touched.c || v.touched.s || !same.category, locNew = v.touched.l || !same.location;
+        if (catNew) { rec.category = v.category; if (v.sub) rec.sub = v.sub; else delete rec.sub; }
+        if (locNew) rec.location = v.location;
+        if ((catNew || locNew) && v.auto) rec.auto = true; else if (v.touched.c || v.touched.s || v.touched.l) delete rec.auto;
+      } else rec = { name, qty: add, category: v.category, ...(v.sub ? { sub: v.sub } : {}), location: v.location, minQty: 0, buyQty: 1, barcode: code, source: 'barcode', ...(v.auto ? { auto: true } : {}) };
+      saveQty(same || null, rec).catch(() => {});
+      toast(`${name} を${rec.location ? `${rec.location}に` : ''}追加しました`); resolve(true);
     };
   });
 }
 
 // ---------- 編集 ----------
 // focus='q' なら数量欄にカーソルを置く。新規は名前欄、編集は何も置かない(キーボードを出さない)
+// 新規のときは上に追加先バーを出し、場所・分類は 手で選んだ値 > 追加先 > 自動分類 の順で決める
+// 「くわしく設定」の中は、まとまりごと(data-grp)に分けてある: class=分類・置き場所 / stock=買い足し / expiry=期限
 function editDialog(it, memo, focus) {
-  const d = $('#dlg'); const x = it || { name: '', qty: 1, minQty: 0, buyQty: 1, category: '', location: '', expiry: '', source: 'manual' };
-  const opts = (arr, v) => `<option value="">未設定</option>${arr.map((c) => `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}`;
+  ctxHook = null; const d = $('#dlg'); const x = it || { name: '', qty: 1, minQty: 0, buyQty: 1, category: '', location: '', expiry: '', source: 'manual' };
   const xc = canonCategory(x.category, guessClass(x.name).category), xl = canonLocation(x.location, x.name); // 古い版の名前は新体系の名前で表示(保存すると新しい名前になる)
-  d.innerHTML = `<form id="f-form" autocomplete="off"><h3 id="dlg-h" ${it ? 'tabindex="-1" autofocus' : ''}>${it ? '編集' : '追加'}</h3>${memo ? `<p class="sub">読み取り結果(参考): <br>${esc(memo.slice(0, 200))}</p>` : ''}
+  d.innerHTML = `<form id="f-form" autocomplete="off"><h3 id="dlg-h" ${it ? 'tabindex="-1" autofocus' : ''}>${it ? '編集' : '追加'}</h3>${memo ? `<p class="sub">読み取り結果(参考): <br>${esc(memo.slice(0, 200))}</p>` : ''}${it ? '' : acb()}
   <label for="f-n">名前</label><input id="f-n" ${it ? '' : 'autofocus list="f-names"'} enterkeyhint="done" autocorrect="off" value="${esc(x.name)}">${it ? '' : `<datalist id="f-names">${items.map((i) => `<option value="${esc(i.name)}">`).join('')}</datalist>`}
   <div class="sub" id="f-dup" role="status"></div>
   <label for="f-q">数量</label><div class="row" style="flex-wrap:wrap"><button type="button" class="b" id="f-qm" tabindex="-1" aria-label="1つ減らす">−</button><input id="f-q" type="number" inputmode="numeric" enterkeyhint="done" min="0" value="${x.qty}" style="text-align:center;font-size:20px;font-weight:700"><button type="button" class="b" id="f-qp" tabindex="-1" aria-label="1つ増やす">＋</button></div>
   <details class="more"><summary id="f-sum"></summary>
-  <div class="grid2"><div><label for="f-m">買い足しライン(この数になったら買い物リストに出す)</label><input id="f-m" type="number" inputmode="numeric" min="0" value="${x.minQty || 0}"></div>
-  <div><label for="f-b">買うときの個数</label><input id="f-b" type="number" inputmode="numeric" min="1" value="${x.buyQty || 1}"></div>
-  <div><label for="f-e">賞味・使用期限</label><input id="f-e" type="date" value="${esc(x.expiry || '')}"></div><div></div>
-  <div><label for="f-c">カテゴリ</label><select id="f-c">${opts(categoryOptions(items), xc)}</select></div><div><label for="f-l">置き場所</label><select id="f-l">${opts(locationOptions(items), xl)}</select></div></div>
-  <div class="sub" id="f-h"></div></details>
+  <div data-grp="class"><div class="grid2"><div><label for="f-c">カテゴリ</label><select id="f-c"></select></div><div><label for="f-s">小分類</label><select id="f-s"></select></div><div><label for="f-l">置き場所</label><select id="f-l"></select></div></div><div class="sub" id="f-h" role="status"></div></div>
+  <div data-grp="stock" class="grid2"><div><label for="f-m">買い足しライン(この数になったら買い物リストに出す)</label><input id="f-m" type="number" inputmode="numeric" min="0" value="${x.minQty || 0}"></div>
+  <div><label for="f-b">買うときの個数</label><input id="f-b" type="number" inputmode="numeric" min="1" value="${x.buyQty || 1}"></div></div>
+  <div data-grp="expiry"><label for="f-e">賞味・使用期限</label><input id="f-e" type="date" value="${esc(x.expiry || '')}"></div></details>
   <div class="btns" style="margin-top:12px">${it ? '' : '<button type="button" class="b" id="again" style="order:2">続けて追加</button>'}<button type="submit" class="b p grow" id="ok" style="order:3">${it ? '保存' : '追加'}</button><button type="button" class="b" id="cx" style="order:1">やめる</button></div>
   ${it ? '<div class="danger"><button type="button" class="b d" id="del" style="width:100%">この品目を削除</button></div>' : ''}</form>`; // Tab順は 続けて追加→追加→やめる(見た目は やめる・続けて追加・追加)
-  // 名前から分類の候補を事前選択する。すでに選んである(または保存済みの)欄は変えない
-  const fC = $('#f-c'), fL = $('#f-l'); let fixC = !!x.category, fixL = !!x.location, sugC = '', sugL = '', sugS = '';
-  const sum = () => { const t = [+$('#f-m').value ? `${$('#f-m').value}以下で買い足し` : '', $('#f-e').value ? `期限 ${dateJa($('#f-e').value)}` : '', fC.value, fL.value].filter(Boolean).join(' ・ '); $('#f-sum').textContent = `くわしく設定${t ? `(${t})` : ''}`; };
-  fC.onchange = () => { fixC = true; sugC = ''; showHint(); }; fL.onchange = () => { fixL = true; sugL = ''; showHint(); };
-  const showHint = () => { $('#f-h').textContent = sugC || sugL ? `自動の候補: ${[sugC, sugL].filter(Boolean).join(' / ')}(変更できます)` : ''; sum(); };
+  const fC = $('#f-c'), fS = $('#f-s'), fL = $('#f-l');
+  const sum = () => { // 追加先で決めた分は上のバーに出ているので、ここには入れない
+    const sr = cf?.values().src || {}, t = [+$('#f-m').value ? `${$('#f-m').value}以下で買い足し` : '', $('#f-e').value ? `期限 ${dateJa($('#f-e').value)}` : '', sr.c === 'ctx' ? '' : fC.value, sr.s === 'ctx' ? '' : fS.value, sr.l === 'ctx' ? '' : fL.value].filter(Boolean).join(' ・ ');
+    $('#f-sum').textContent = `くわしく設定${t ? `(${t})` : ''}`;
+  };
+  const cf = classForm({ fC, fS, fL, getName: () => $('#f-n').value, id: x.id, init: { category: xc, sub: x.sub, location: xl, auto: x.auto }, useCtx: !it, onChange: () => { $('#f-h').textContent = cf.hint(); sum(); } });
   const dupOf = () => (it ? null : items.find((i) => norm(i.name) === norm($('#f-n').value) && $('#f-n').value.trim()));
   const suggest = () => {
-    const r = autoClassify({ id: x.id, name: $('#f-n').value, category: fixC ? fC.value : '', location: fixL ? fL.value : '' }, items, { locs: locationOptions(items) });
-    sugS = r.sub; if (!fixC) { fC.value = sugC = r.category; }
-    if (!fixL) { fL.value = sugL = r.location; }
+    cf.recompute();
     const ex = dupOf();
-    $('#f-dup').textContent = ex ? `「${ex.name}」は登録済みです(いま ${ex.qty})。追加すると数量が足されます。` : '';
+    $('#f-dup').textContent = ex ? `「${ex.name}」は登録済みです(いま ${ex.qty})。追加すると数量が足されます(場所・分類はそのまま)。` : '';
     $('#ok').textContent = ex ? '数量を足す' : it ? '保存' : '追加';
-    showHint();
   };
   $('#f-n').oninput = suggest; suggest();
+  if (!it) ctxHook = suggest; // 追加先が変わったら、名前から決めた分を計算し直す
   ['f-m', 'f-e'].forEach((k) => ($(`#${k}`).oninput = sum));
   const step = (n) => { const q = $('#f-q'); q.value = Math.max(0, (+q.value || 0) + n); };
   $('#f-qm').onclick = () => step(-1); $('#f-qp').onclick = () => step(1);
@@ -851,18 +1015,16 @@ function editDialog(it, memo, focus) {
   $('#del')?.addEventListener('click', () => { d.close(); store.remove(it.id).catch((e) => toast(`削除できませんでした: ${e.code || e.message}`)); toast(`「${it.name}」を削除しました`, () => save(it)); });
   const submit = (again) => {
     const name = $('#f-n').value.trim(); if (!name) { toast('名前を入れてください'); $('#f-n').focus(); return; }
-    const qty = +$('#f-q').value || 0, ex = dupOf();
-    if (ex) saveQty(ex, { ...ex, qty: ex.qty + qty }).catch(() => {});
+    const qty = +$('#f-q').value || 0, ex = dupOf(), v = cf.values(); let wh = '';
+    if (ex) saveQty(ex, { ...ex, qty: ex.qty + qty }).catch(() => {}); // 同名の品は数量だけ足す(場所・分類は変えない)
     else {
-      const rec = { ...x, name, qty, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: fC.value, location: fL.value };
-      if (rec.sub && canonCategory(fC.value, '') !== xc) delete rec.sub; // 大分類を変えたら古い小分類は外す
-      // 自動の候補をそのまま使った(または以前の自動分類から変えていない)なら「自動」の印を付ける
-      const keep = x.auto && fC.value === xc && fL.value === xl;
-      if (keep || (sugC && fC.value === sugC) || (sugL && fL.value === sugL)) rec.auto = true; else delete rec.auto;
-      if (rec.auto && sugS && !rec.sub) rec.sub = sugS; // 自動分類のときだけ小分類も自動で補う(手で選んだ分類には足さない)
+      const rec = { ...x, name, qty, minQty: +$('#f-m').value || 0, buyQty: +$('#f-b').value || 1, expiry: $('#f-e').value, category: v.category, location: v.location };
+      if (v.sub) rec.sub = v.sub; else delete rec.sub;
+      if (v.auto) rec.auto = true; else delete rec.auto; // 自動の候補をそのまま使った場合だけ「自動」の印(手で選んだ値・追加先の値には付けない)
       saveQty(it || null, rec).catch(() => {}); // 送信は待たない(オフラインでも閉じる)。失敗は toast で知らせる
+      wh = rec.location;
     }
-    toast(it ? `「${name}」を保存しました` : ex ? `「${name}」に ${qty} 足しました` : `「${name}」を追加しました`);
+    toast(it ? `「${name}」を保存しました` : ex ? `「${name}」に ${qty} 足しました${ex.location ? `(${canonLocation(ex.location, ex.name)})` : ''}` : `「${name}」を${wh ? `${wh}に` : ''}追加しました`);
     if (again) { editDialog(); $('#f-n').focus(); } else d.close();
   };
   $('#f-form').onsubmit = (e) => { e.preventDefault(); submit(false); };
@@ -887,6 +1049,7 @@ dlg.addEventListener('click', (e) => {
 });
 dlg.addEventListener('close', () => {
   if (dlg.dataset.kind === 'review') { readCancel?.(); resetReview(); } // 写真(ObjectURL)をここで手放す
+  if (['edit', 'barcode', 'review'].includes(dlg.dataset.kind)) endCtx(); // 追加が終わったので、固定でなければ追加先を「おまかせ」に戻す
   const o = dlgOrigin; dlgOrigin = null; if (!o) return;
   (o.el.isConnected ? o.el : o.id && document.querySelector(`.it[data-id="${o.id}"] ${o.sel}`))?.focus?.({ preventScroll: true });
 });
@@ -898,10 +1061,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ---------- 起動 ----------
-document.querySelectorAll('#tabs [data-tab]').forEach((b) => (b.onclick = () => { if (tab !== b.dataset.tab) { shopDone.clear(); scrollTo(0, 0); } tab = b.dataset.tab; render(); }));
+document.querySelectorAll('#tabs [data-tab]').forEach((b) => (b.onclick = () => { if (tab !== b.dataset.tab) { shopDone.clear(); scrollTo(0, 0); } if (tab === 'import' && b.dataset.tab !== 'import') endCtx(); tab = b.dataset.tab; render(); }));
 $('#addnav').onclick = () => state.household && editDialog();
 // 数量などの数字欄は、タップしたら全選択(そのまま打てば置き換わる)
 document.addEventListener('focusin', (e) => { if (e.target.matches?.('input[type=number]')) try { e.target.select(); } catch {} });
+renderBars(); // 固定していた追加先があれば、ナビの＋の読み上げに反映
 (async () => {
   store = await createStore();
   await store.init((s) => {
