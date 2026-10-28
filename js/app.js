@@ -3,16 +3,16 @@ import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
 import { ocr, warmupOcr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
 import { scan, lookupName } from './barcode.js';
-import { CATS, LOCS, canonCategory, canonLocation, categoryOptions, locationOptions, matchCategory, matchLocation } from './taxonomy.js';
+import { CATS, LOCS, LEGACY_CATEGORY, canonCategory, canonLocation, catInfo, locInfo, categoryOptions, locationOptions } from './taxonomy.js';
 import { guessClass } from './category.js';
-import { plan, daysLeft, expiryDays, withLog, autoClassify, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
+import { plan, daysLeft, expiryDays, withLog, autoClassify, EXPIRY_DAYS, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const SRC = { amazon: 'Amazon', rakuten: '楽天', receipt: 'レシート', paste: '貼り付け', manual: '手入力', barcode: 'バーコード' };
 
 let store, state = { user: null, household: null }, items = [], unsub = null, lastSig = '', syncMsg = '';
-let tab = 'stock', q = '', cat = '', loc = '';
+let tab = 'stock', q = '', filterKey = ''; // 在庫一覧の検索語と、要約チップの絞り込み('' / 'low' / 'exp')
 let draft = []; // 取り込み確認中の候補
 let receipts = []; // 確認中のレシートごとの {store, date, total, tax, adjust}。draft の rid が添字
 
@@ -51,9 +51,19 @@ const etaText = (d) => (d < 1 ? 'あと1日未満' : d <= 180 ? `あと約${Math
 // ---------- 画面 ----------
 const JOIN = (new URLSearchParams(location.search).get('join') || '').trim().toUpperCase(); // 家族の誘いリンク ?join=コード
 const clearJoin = () => { try { history.replaceState(null, '', location.pathname + location.hash); } catch {} };
-const SORTS = [['std', '足りないものが先'], ['name', '名前順'], ['expiry', '期限が近い順'], ['eta', 'なくなりそうな順'], ['loc', '置き場所別'], ['recent', '最近変えた順']];
-let sortKey = 'std'; try { const s = localStorage.getItem('hs-sort'); if (SORTS.some(([k]) => k === s)) sortKey = s; } catch {}
-let filterOpen = false;
+const SORTS = [['std', '並び: 足りない順'], ['expiry', '並び: 期限が近い順'], ['eta', '並び: なくなりそうな順'], ['name', '並び: 名前順'], ['recent', '並び: 最近変えた順']];
+const VIEWS = [['loc', '置き場所別'], ['cat', '分類別'], ['flat', 'すべて']];
+// 端末ごとの見かた(hs-view=表示のしかた / hs-sort=並び / hs-fold=たたんだ見出し)。保存できなくても動く
+let sortKey = 'std', viewMode = 'loc', foldS = { cat: new Set(), loc: new Set() };
+try {
+  const s = localStorage.getItem('hs-sort'), v = localStorage.getItem('hs-view');
+  if (SORTS.some(([k]) => k === s)) sortKey = s;
+  if (VIEWS.some(([k]) => k === v)) viewMode = v;
+  if (s === 'loc') { viewMode = 'loc'; localStorage.setItem('hs-view', 'loc'); localStorage.setItem('hs-sort', 'std'); } // 旧「置き場所別の並び」は表示のしかたへ移した
+  const o = JSON.parse(localStorage.getItem('hs-fold'));
+  for (const k of ['cat', 'loc']) if (Array.isArray(o?.[k])) foldS[k] = new Set(o[k].filter((x) => typeof x === 'string'));
+} catch {}
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 // 検索用: ひらがな/カタカナ・全角半角・大文字小文字・空白と「・」の違いを無視する(長音や小書き文字は変えない)
 const fold = (s) => String(s ?? '').normalize('NFKC').toLowerCase().replace(/[ぁ-ゖ]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 96)).replace(/[\s・]+/g, '');
 // 2026-10-26 → 10月26日(年が違うときだけ年つき)
@@ -61,6 +71,7 @@ const dateJa = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s || ''); retu
 const whoText = () => (!state.user ? '' : store.mode === 'local' ? 'この携帯だけで使用中' : `${state.household?.name ?? ''} / ${state.user.name}${syncMsg}`);
 
 function render() {
+  document.body.dataset.screen = tab; // 在庫タブだけ、ヘッダーを固定しない(一覧の見出しを画面の上端に張り付かせるため)
   document.querySelectorAll('#tabs [data-tab]').forEach((b) => { const on = b.dataset.tab === tab; b.classList.toggle('on', on); if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
   $('#who').textContent = whoText();
   const ready = !!(state.user && state.household);
@@ -89,79 +100,189 @@ function renderSetup(v) {
   $('#jc').onkeydown = (e) => { if (e.key === 'Enter') $('#jn').click(); };
 }
 
-// 期限は7日以内/切れを目立たせる。「あと約N日」は消費ペースを学習済みの品だけ
-function expiryHtml(i) {
-  const d = expiryDays(i, Date.now());
-  if (d === null) return i.expiry ? `<span class="t">期限 ${dateJa(i.expiry)}</span>` : '';
-  if (d < 0) return `<span class="t warn">期限切れ(${dateJa(i.expiry)})</span>`;
-  return d <= 7 ? `<span class="t warn">期限まであと${d}日</span>` : `<span class="t">期限 ${dateJa(i.expiry)}</span>`;
+// ---------- 在庫の一覧 ----------
+// −/＋ を押した直後は並び順を保つ(押した品が「残りわずか」で先頭へ飛び、次のタップが別の品に当たるのを防ぐ)。subOrder: 固定中の小分類の順
+let hold = { until: 0, ids: [], subOrder: new Map() };
+let tmpClosed = new Set(); // 絞り込み中に開閉した見出し(保存しない。絞り込みが変わると戻る)
+let idMap = new Map();
+const FILTERS = [['', 'all', 'ぜんぶ'], ['low', 'low', '足りない'], ['exp', 'exp', '期限が近い']];
+const UNCAT = { name: '未分類', icon: '🏷️', color: 'gray' }, NOLOC = { name: '置き場所なし', icon: '📍' };
+const CHEV = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+
+// 1品ぶんの導出値(状態・期限・大分類・置き場所)。描画1回につき1品1回だけ計算して、行・見出し・要約で使い回す
+function infoOf(i, now) {
+  const d = expiryDays(i, now), low = isLow(i), raw = String(i.category ?? '').trim();
+  const rank = d !== null && d < 0 ? 0 : low && i.qty <= 0 ? 1 : low ? 2 : d !== null && d <= EXPIRY_DAYS ? 3 : 9; // 状態の重さ
+  const cat = canonCategory(raw, LEGACY_CATEGORY[raw] ? guessClass(i.name).category : ''), loc = canonLocation(i.location, i.name);
+  return { i, d, low, rank, near: d !== null && d <= EXPIRY_DAYS, cat, ci: catInfo(cat), loc, li: locInfo(loc), sub: String(i.sub ?? '').trim() };
 }
-function etaHtml(i) {
-  const d = i.qty > 0 ? daysLeft(i, Date.now()) : null;
-  return d === null ? '' : `<span class="t eta ${d <= 7 ? 'warn' : ''}">${etaText(d)}</span>`;
+const pillOf = (x) => (x.rank === 0 ? ['expired', '⛔', '期限切れ'] : x.rank === 1 ? ['zero', '✕', 'なくなった'] : x.rank === 2 ? ['low', '⚠', '残りわずか']
+  : x.rank === 3 ? ['soon', '⏰', x.d === 0 ? '今日まで' : `あと${x.d}日`] : x.i.qty <= 0 ? ['none', '', '在庫なし'] : null);
+const SORT_CMP = (now) => {
+  const nameCmp = (a, b) => a.i.name.localeCompare(b.i.name, 'ja');
+  return {
+    std: (a, b) => a.rank - b.rank || nameCmp(a, b), name: nameCmp,
+    expiry: (a, b) => (a.d ?? 1e9) - (b.d ?? 1e9) || nameCmp(a, b),
+    eta: (a, b) => (a.i.qty <= 0 ? -1 : daysLeft(a.i, now) ?? 1e9) - (b.i.qty <= 0 ? -1 : daysLeft(b.i, now) ?? 1e9) || nameCmp(a, b),
+    recent: (a, b) => (b.i.updatedAt || 0) - (a.i.updatedAt || 0),
+  };
+};
+
+function rowHtml(x, ctx) {
+  const { i, ci, li } = x, p = pillOf(x), where = li.name ? `${li.icon} ${esc(li.name)}` : '<i>置き場所なし</i>';
+  const sec = ctx === 'cat' ? where : ctx === 'loc' ? `${ci.icon} ${esc(x.sub || ci.name || '未分類')}` : `${ci.icon} ${esc(x.sub || ci.name || '未分類')} ・ ${where}`;
+  const state = p ? `(${p[2]})` : '';
+  return `<div class="it${x.low ? ' low' : ''}" data-id="${esc(i.id)}" style="--st:var(--c-${ci.color}-fg)"><button class="info" data-edit aria-label="${esc(i.name)}を編集"><span class="nm">${esc(i.name)}</span><span class="meta">${p ? `<span class="pill ${p[0]}">${p[1] ? `<span aria-hidden="true">${p[1]}</span> ` : ''}${p[2]}</span>` : ''}<span>${sec}</span></span></button>`
+    + `<div class="ctl"><button class="pm" data-d="-1" aria-label="${esc(i.name)}を1つ減らす">−</button><button class="qty" data-q aria-label="${esc(i.name)} 残り${i.qty}${state}。タップして数を入力">${i.qty}</button><button class="pm" data-d="1" aria-label="${esc(i.name)}を1つ増やす">＋</button></div></div>`;
 }
 
-// −/＋ を押した直後は並び順を保つ(押した品が「残りわずか」で先頭へ飛び、次のタップが別の品に当たるのを防ぐ)
-let hold = { until: 0, ids: [] };
+// 大分類でまとめる: TAXONOMY の順 → 家族が付けた分類(多い順) → 未分類。小分類の小見出しは足りない/期限が近い品のある所を上へ
+function groupByCat(list, held) {
+  const by = new Map(), order = [...CATS];
+  for (const x of list) { if (!by.has(x.cat)) by.set(x.cat, []); by.get(x.cat).push(x); }
+  const extra = [...by.keys()].filter((k) => k && !CATS.includes(k)).sort((a, b) => by.get(b).length - by.get(a).length || a.localeCompare(b, 'ja'));
+  const out = [];
+  for (const k of [...order, ...extra, '']) {
+    const a = by.get(k); if (!a) continue;
+    const ci = k ? catInfo(k) : UNCAT, g = { key: k || UNCAT.name, name: ci.name || UNCAT.name, icon: ci.icon, color: ci.color, items: a, hint: k ? '' : '分類をつけると探しやすくなります。品名をタップして編集できます。' };
+    if (ci.subs?.length) {
+      const names = [...ci.subs, ...new Set(a.map((x) => x.sub).filter((s) => s && !ci.subs.includes(s)))];
+      let subs = names.map((n) => [n, a.filter((x) => (x.sub || 'その他') === n)]).filter(([, arr]) => arr.length);
+      if (held && hold.subOrder.has(g.key)) { const ix = new Map(hold.subOrder.get(g.key).map((n, j) => [n, j])); subs.sort((p, q) => (ix.get(p[0]) ?? 1e9) - (ix.get(q[0]) ?? 1e9)); }
+      else if (sortKey === 'std' || sortKey === 'expiry') {
+        const key = (arr) => Math.min(...arr.map((x) => (sortKey === 'std' ? x.rank : x.d ?? 1e9)));
+        subs = subs.map((s, n) => [s, n]).sort((p, q) => key(p[0][1]) - key(q[0][1]) || p[1] - q[1]).map(([s]) => s);
+      }
+      hold.subOrder.set(g.key, subs.map(([n]) => n));
+      g.subs = subs;
+    }
+    out.push(g);
+  }
+  return out;
+}
+// 置き場所でまとめる: LOCS の順 → 一覧にない置き場所(多い順) → 置き場所なし
+function groupByLoc(list) {
+  const by = new Map();
+  for (const x of list) { if (!by.has(x.loc)) by.set(x.loc, []); by.get(x.loc).push(x); }
+  const extra = [...by.keys()].filter((k) => k && !LOCS.includes(k)).sort((a, b) => by.get(b).length - by.get(a).length || a.localeCompare(b, 'ja'));
+  const out = [];
+  for (const k of [...LOCS, ...extra, '']) {
+    const a = by.get(k); if (!a) continue;
+    const li = k ? locInfo(k) : NOLOC;
+    out.push({ key: li.name, name: li.name, icon: li.icon, place: true, items: a, hint: k ? '' : '置き場所をつけると、冷蔵庫など場所ごとに見られます。' });
+  }
+  return out;
+}
+function groupHtml(g, n, ctx, closed) {
+  const nl = g.items.filter((x) => x.low).length, ne = g.items.filter((x) => x.near).length, id = `g-${ctx}-${n}`, shut = closed.has(g.key);
+  const colors = g.place ? '--gbg:var(--place-bg);--gfg:var(--place-fg)' : `--gbg:var(--c-${g.color}-bg);--gfg:var(--c-${g.color}-fg)`;
+  const body = g.subs ? g.subs.map(([sn, arr]) => `<h4 class="sh">${esc(sn)}<span>${arr.length}品</span></h4>${arr.map((x) => rowHtml(x, ctx)).join('')}`).join('') : g.items.map((x) => rowHtml(x, ctx)).join('');
+  return `<section class="lg" style="${colors}"><h3 class="gh"><button data-fold="${esc(g.key)}" aria-expanded="${!shut}" aria-controls="${id}"><span class="ic" aria-hidden="true">${g.icon}</span><span class="gn">${esc(g.name)}<span class="ct">${g.items.length}品</span></span><span class="gr"><span class="bdg">${nl ? `<span class="hb low">足りない ${nl}</span>` : ''}${ne ? `<span class="hb exp">期限 ${ne}</span>` : ''}</span><span class="chev" aria-hidden="true">${CHEV}</span></span></button></h3>`
+    + `<div class="gbody" id="${id}" ${shut ? 'hidden' : ''}>${g.hint ? `<p class="gnote">${g.hint}</p>` : ''}${body}</div></section>`;
+}
+
 function renderStock(v) {
   if (!items.length) {
-    v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="empty">まだ登録がありません。<br>最初の1品を追加してみましょう。<br><button class="b p" id="e-add">品目を追加</button><br><button class="b" id="e-imp">レシートやバーコードでまとめて追加</button></div>`;
+    v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="empty"><div class="big" aria-hidden="true">📦</div><p class="tt">まだ登録がありません</p><p>最初の1品を追加してみましょう。</p><button class="b p" id="e-add">品目を追加</button><br><button class="b" id="e-imp">レシートやバーコードでまとめて追加</button></div>`;
     $('#e-add').onclick = () => editDialog(); $('#e-imp').onclick = () => { tab = 'import'; render(); };
     return;
   }
-  const nf = (cat ? 1 : 0) + (loc ? 1 : 0);
-  const chipset = (arr, cur, k) => `<button class="chip ${cur ? '' : 'on'}" data-${k}="" aria-pressed="${!cur}">すべて</button>${arr.map((c) => `<button class="chip ${cur === c ? 'on' : ''}" data-${k}="${esc(c)}" aria-pressed="${cur === c}">${esc(c)}</button>`).join('')}`;
-  v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="row"><div class="sw"><input id="q" type="search" enterkeyhint="search" placeholder="さがす(ひらがなでもOK)" aria-label="品名でさがす" autocomplete="off" value="${esc(q)}"><button class="x" id="qx" aria-label="入力を消す" ${q ? '' : 'hidden'}>×</button></div><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>
-  <div class="fbar"><button class="b ${nf ? 'on' : ''}" id="ftg" aria-expanded="${filterOpen}" aria-controls="fp">絞り込み${nf ? `(${nf})` : ''} ${filterOpen ? '▴' : '▾'}</button><select id="srt" aria-label="並び順">${SORTS.map(([k, t]) => `<option value="${k}" ${k === sortKey ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
-  ${filterOpen ? `<div id="fp"><div class="fgroup" id="fg1">カテゴリ</div><div class="chips" role="group" aria-labelledby="fg1">${chipset(categoryOptions(items), cat, 'cat')}</div><div class="fgroup" id="fg2">置き場所</div><div class="chips" role="group" aria-labelledby="fg2">${chipset(locationOptions(items), loc, 'loc')}</div></div>` : ''}<div id="lst"></div>`;
-  const again = () => { hold.until = 0; renderStock(v); };
-  $('#q').oninput = (e) => { q = e.target.value; $('#qx').hidden = !q; hold.until = 0; renderList(); };
-  $('#qx').onclick = () => { q = ''; $('#q').value = ''; $('#qx').hidden = true; hold.until = 0; renderList(); $('#q').focus(); };
-  $('#ftg').onclick = () => { filterOpen = !filterOpen; renderStock(v); $('#ftg').focus(); };
-  $('#srt').onchange = (e) => { sortKey = e.target.value; try { localStorage.setItem('hs-sort', sortKey); } catch {} hold.until = 0; renderList(); };
-  v.querySelectorAll('[data-cat]').forEach((b) => (b.onclick = () => { cat = b.dataset.cat; again(); }));
-  v.querySelectorAll('[data-loc]').forEach((b) => (b.onclick = () => { loc = b.dataset.loc; again(); }));
+  v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="srow"><div class="sw"><input id="q" type="search" enterkeyhint="search" placeholder="さがす(ひらがなでもOK)" aria-label="品名でさがす" autocomplete="off" value="${esc(q)}"><button class="x" id="qx" aria-label="入力を消す" ${q ? '' : 'hidden'}>×</button></div><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>
+  <div class="sum" id="sum" role="group" aria-label="状態でしぼりこむ">${FILTERS.map(([f, c, l]) => `<button class="sc ${c}" data-f="${f}" aria-pressed="false"><span class="n"></span><span class="l">${l}</span></button>`).join('')}</div>
+  <div class="seg" id="segw" role="group" aria-label="表示のしかた">${VIEWS.map(([k, t]) => `<button data-mode="${k}" aria-pressed="false">${t}</button>`).join('')}</div>
+  <div class="tools"><select id="srt" aria-label="並び替え">${SORTS.map(([k, t]) => `<option value="${k}">${t}</option>`).join('')}</select><button class="fold" id="foldall"></button></div>
+  <div class="filt" id="filt" hidden><span class="t" id="filt-t" role="status"></span><button class="b" data-clear>解除</button></div><div id="lst"></div>`;
+  const reset = () => { hold.until = 0; tmpClosed = new Set(); };
+  const clearAll = () => { q = filterKey = ''; $('#q').value = ''; $('#qx').hidden = true; reset(); renderList(); $('#sum [data-f=""]').focus({ preventScroll: true }); };
+  $('#q').oninput = (e) => { q = e.target.value; $('#qx').hidden = !q; reset(); renderList(); };
+  $('#qx').onclick = () => { q = ''; $('#q').value = ''; $('#qx').hidden = true; reset(); renderList(); $('#q').focus(); };
+  $('#sum').onclick = (e) => { const b = e.target.closest('[data-f]'); if (!b) return; filterKey = b.dataset.f === filterKey ? '' : b.dataset.f; reset(); renderList(); };
+  $('#segw').onclick = (e) => {
+    const b = e.target.closest('[data-mode]'); if (!b || b.dataset.mode === viewMode) return;
+    viewMode = b.dataset.mode; lsSet('hs-view', viewMode); reset(); renderList();
+    const y = $('#sum').getBoundingClientRect().top + scrollY - 8; if (scrollY > y) scrollTo(0, Math.max(0, y)); // 一覧の先頭が見える所まで戻す
+  };
+  $('#srt').onchange = (e) => { sortKey = e.target.value; lsSet('hs-sort', sortKey); reset(); renderList(); };
+  $('#foldall').onclick = () => {
+    const bs = [...$('#lst').querySelectorAll('[data-fold]')], shut = !bs.every((b) => b.getAttribute('aria-expanded') === 'false');
+    bs.forEach((b) => setOpen(b, !shut)); saveFold(); syncFoldBtn();
+  };
+  $('#filt [data-clear]').onclick = clearAll;
   $('#scan').onclick = barcodeAdd;
-  renderList();
-}
-
-function renderList() {
-  const el = $('#lst'), now = Date.now();
-  const nameCmp = (a, b) => a.name.localeCompare(b.name, 'ja');
-  const cmp = {
-    std: (a, b) => isLow(b) - isLow(a) || nameCmp(a, b), name: nameCmp,
-    expiry: (a, b) => (expiryDays(a, now) ?? 1e9) - (expiryDays(b, now) ?? 1e9) || nameCmp(a, b),
-    eta: (a, b) => (a.qty <= 0 ? -1 : daysLeft(a, now) ?? 1e9) - (b.qty <= 0 ? -1 : daysLeft(b, now) ?? 1e9) || nameCmp(a, b),
-    loc: (a, b) => (LOCS.indexOf(canonLocation(a.location, a.name)) + 99) % 99 - (LOCS.indexOf(canonLocation(b.location, b.name)) + 99) % 99 || nameCmp(a, b),
-    recent: (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0),
-  }[sortKey];
-  const fq = fold(q);
-  const list = items.filter((i) => matchCategory(i, cat) && matchLocation(i, loc) && (!fq || fold(i.name).includes(fq)));
-  if (now < hold.until) { const ix = new Map(hold.ids.map((id, n) => [id, n])); list.sort((a, b) => (ix.get(a.id) ?? 1e9) - (ix.get(b.id) ?? 1e9)); }
-  else list.sort(cmp);
-  hold.ids = list.map((i) => i.id);
-  const filtered = !!(cat || loc || q);
-  // 再描画で消える要素にフォーカスがあったら、同じ品目の同じボタンへ戻す(連続して押せるように)
-  const ae = document.activeElement, fk = ae && el.contains(ae) ? [ae.closest('.item')?.dataset.id, ae.dataset.d ? `[data-d="${ae.dataset.d}"]` : ae.matches('[data-q]') ? '[data-q]' : ae.matches('[data-edit]') ? '[data-edit]' : ''] : null;
-  const bar = filtered ? `<div class="row"><div class="sub grow" role="status">${list.length}件を表示中(${esc([cat, loc, q && `「${q}」`].filter(Boolean).join(' ・ '))})</div><button class="b" id="clr">解除</button></div>` : '';
-  el.innerHTML = bar + (list.length ? list.map((i) => `<div class="card item row ${isLow(i) ? 'low' : ''}" data-id="${i.id}">
-      <div class="info" data-edit role="button" tabindex="0" aria-label="${esc(i.name)}を編集"><div class="nm">${esc(i.name)}</div><div class="sub">${loc ? '' : `<span class="t">${esc(i.location || '')}</span>`}${cat ? '' : `<span class="t">${esc(i.category || '')}</span>`}${i.auto ? '<span class="auto" title="自動でつけた分類です。違っていれば編集で直せます" role="img" aria-label="自動でつけた分類">自動</span>' : ''}${expiryHtml(i)}${etaHtml(i)}</div></div>
-      <div class="ctl"><button class="b" data-d="-1" aria-label="${esc(i.name)}を1つ減らす">−</button><button class="qty" data-q title="タップして数を入力" aria-label="${esc(i.name)} 残り${i.qty}${isLow(i) ? '(残りわずか)' : ''}。タップして数を入力">${i.qty}</button><button class="b" data-d="1" aria-label="${esc(i.name)}を1つ増やす">＋</button></div></div>`).join('')
-    : `<div class="empty">条件に合う品目がありません</div>`);
-  el.querySelectorAll('.item').forEach((row) => {
-    const it = items.find((x) => x.id === row.dataset.id), ed = row.querySelector('[data-edit]');
-    ed.onclick = () => editDialog(it);
-    ed.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); editDialog(it); } };
-    row.querySelector('[data-q]').onclick = () => editDialog(it, null, 'q');
-    row.querySelectorAll('[data-d]').forEach((b) => (b.onclick = () => {
-      const qty = Math.max(0, it.qty + +b.dataset.d); if (qty === it.qty) return;
+  $('#lst').onclick = (e) => {
+    const t = e.target.closest('button'); if (!t) return;
+    if (t.dataset.fold !== undefined) { setOpen(t, t.getAttribute('aria-expanded') !== 'true'); saveFold(); syncFoldBtn(); return; }
+    if (t.dataset.clear !== undefined) return clearAll();
+    const row = t.closest('.it'), it = row && idMap.get(row.dataset.id); if (!it) return;
+    if (t.dataset.edit !== undefined) editDialog(it);
+    else if (t.dataset.q !== undefined) editDialog(it, null, 'q');
+    else if (t.dataset.d) {
+      const qty = Math.max(0, it.qty + +t.dataset.d); if (qty === it.qty) return;
       hold.until = Date.now() + 6000;
       saveQty(it, { ...it, qty }).catch(() => {});
       toast(`${it.name}: ${it.qty} → ${qty}`, () => save(it));
-    }));
+    }
+  };
+  renderList();
+}
+
+// 見出しの開閉(一覧は作り直さない=フォーカスもスクロールも動かない)。絞り込み中は保存しない
+const closedSet = () => (filterKey || fold(q) ? tmpClosed : foldS[viewMode]);
+function setOpen(btn, open) {
+  btn.setAttribute('aria-expanded', open); $(`#${btn.getAttribute('aria-controls')}`).hidden = !open;
+  const s = closedSet(); open ? s.delete(btn.dataset.fold) : s.add(btn.dataset.fold);
+}
+function saveFold() {
+  if (filterKey || fold(q)) return;
+  const keys = new Set([...$('#lst').querySelectorAll('[data-fold]')].map((b) => b.dataset.fold)); // 今ない見出しのキーはここで掃除
+  foldS[viewMode] = new Set([...foldS[viewMode]].filter((k) => keys.has(k)));
+  lsSet('hs-fold', JSON.stringify({ cat: [...foldS.cat], loc: [...foldS.loc] }));
+}
+function syncFoldBtn() {
+  const bs = [...$('#lst').querySelectorAll('[data-fold]')], all = bs.length > 0 && bs.every((b) => b.getAttribute('aria-expanded') === 'false'), f = $('#foldall');
+  f.hidden = viewMode === 'flat'; f.textContent = all ? 'すべて開く' : 'すべてたたむ'; f.setAttribute('aria-label', all ? 'すべての見出しを開く' : 'すべての見出しをたたむ');
+}
+
+function renderList() {
+  const el = $('#lst'), now = Date.now(), fq = fold(q), filtering = !!(filterKey || fq);
+  const infos = items.map((i) => infoOf(i, now));
+  idMap = new Map(items.map((i) => [i.id, i]));
+  let nLow = 0, nNear = 0;
+  for (const x of infos) { if (x.low) nLow++; if (x.near) nNear++; }
+  const list = infos.filter((x) => (!filterKey || (filterKey === 'low' ? x.low : x.near)) && (!fq || fold(x.i.name).includes(fq)));
+  const held = now < hold.until;
+  if (held) { const ix = new Map(hold.ids.map((id, n) => [id, n])); list.sort((a, b) => (ix.get(a.i.id) ?? 1e9) - (ix.get(b.i.id) ?? 1e9)); }
+  else list.sort(SORT_CMP(now)[sortKey]);
+  hold.ids = list.map((x) => x.i.id);
+  // 再描画で消える要素にフォーカスがあったら、同じ品目の同じボタンへ戻す(連続して押せるように)
+  const ae = document.activeElement, fk = ae && el.contains(ae) ? (ae.dataset.fold !== undefined ? { fold: ae.dataset.fold } : { id: ae.closest('.it')?.dataset.id, sel: ae.dataset.d ? `[data-d="${ae.dataset.d}"]` : ae.matches('[data-q]') ? '[data-q]' : '[data-edit]' }) : null;
+  // 上の部品は作り直さず、属性と数字だけ更新する
+  $('#sum').querySelectorAll('[data-f]').forEach((b) => {
+    const f = b.dataset.f, n = f === 'low' ? nLow : f === 'exp' ? nNear : items.length, l = FILTERS.find((x) => x[0] === f)[2];
+    b.querySelector('.n').textContent = n; b.setAttribute('aria-pressed', f === filterKey); b.setAttribute('aria-label', `${l} ${n}品`);
   });
-  $('#clr')?.addEventListener('click', () => { q = cat = loc = ''; hold.until = 0; renderStock($('#view')); });
-  if (fk?.[0] && fk[1]) el.querySelector(`.item[data-id="${fk[0]}"] ${fk[1]}`)?.focus({ preventScroll: true });
+  $('#segw').querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.mode === viewMode));
+  $('#srt').value = sortKey;
+  const ft = [filterKey && `「${filterKey === 'low' ? '足りない' : '期限が近い'}」`, q.trim() && `「${q.trim()}」`].filter(Boolean).join('と') + `で絞り込み中: ${list.length}品`;
+  $('#filt').hidden = !filtering; if ($('#filt-t').textContent !== ft) $('#filt-t').textContent = ft;
+  let html;
+  if (!list.length) {
+    const none = q.trim() && !filterKey ? `<div class="big" aria-hidden="true">🔍</div><p class="tt">「${esc(q.trim())}」は見つかりません</p><p>ひらがなでも探せます。ほかの言葉や、短い言葉で試してください。</p>`
+      : filterKey === 'low' ? `<div class="big" aria-hidden="true">🎉</div><p class="tt">足りないものはありません</p><p>すべて、買い足しラインより多くあります。</p>`
+      : filterKey === 'exp' ? `<div class="big" aria-hidden="true">👍</div><p class="tt">期限が近いものはありません</p><p>7日以内に期限が来る品はありません。</p>`
+      : `<div class="big" aria-hidden="true">🔍</div><p class="tt">条件に合う品はありません</p>`;
+    html = `<div class="empty">${none}<button class="b p" data-clear>${q.trim() && !filterKey ? '検索を消す' : 'すべての品を見る'}</button></div>`;
+  } else if (viewMode === 'flat') html = list.map((x) => rowHtml(x, 'flat')).join('');
+  else {
+    const closed = closedSet(), gs = viewMode === 'cat' ? groupByCat(list, held) : groupByLoc(list);
+    html = gs.map((g, n) => groupHtml(g, n, viewMode, closed)).join('');
+  }
+  el.innerHTML = html;
+  syncFoldBtn();
+  if (fk) {
+    const t = fk.fold !== undefined ? [...el.querySelectorAll('[data-fold]')].find((b) => b.dataset.fold === fk.fold) : [...el.querySelectorAll('.it')].find((r) => r.dataset.id === fk.id)?.querySelector(fk.sel);
+    t?.focus({ preventScroll: true });
+  }
 }
 
 // 買い物: 「買った」を押した品はその場に残して(取り消し線)、押し間違いはすぐ戻せる。タブを離れると消える
@@ -754,7 +875,7 @@ function editDialog(it, memo, focus) {
 // 閉じたら開いた元の要素へフォーカスを戻す。短い入力ダイアログ(edit)は、まだ何も入力していなければ外側タップで閉じる
 const dlg = $('#dlg'); let dlgOrigin = null, dlgDirty = false;
 function openDlg(kind) {
-  if (!dlg.open) { const a = document.activeElement; dlgOrigin = a && a !== document.body ? { el: a, id: a.closest?.('.item')?.dataset.id, sel: a.matches?.('[data-q]') ? '[data-q]' : '[data-edit]' } : null; }
+  if (!dlg.open) { const a = document.activeElement; dlgOrigin = a && a !== document.body ? { el: a, id: a.closest?.('.it')?.dataset.id, sel: a.matches?.('[data-q]') ? '[data-q]' : '[data-edit]' } : null; }
   dlg.dataset.kind = kind; dlgDirty = false; dlg.setAttribute('aria-labelledby', 'dlg-h');
   if (!dlg.open) dlg.showModal();
 }
@@ -767,7 +888,7 @@ dlg.addEventListener('click', (e) => {
 dlg.addEventListener('close', () => {
   if (dlg.dataset.kind === 'review') { readCancel?.(); resetReview(); } // 写真(ObjectURL)をここで手放す
   const o = dlgOrigin; dlgOrigin = null; if (!o) return;
-  (o.el.isConnected ? o.el : o.id && document.querySelector(`.item[data-id="${o.id}"] ${o.sel}`))?.focus?.({ preventScroll: true });
+  (o.el.isConnected ? o.el : o.id && document.querySelector(`.it[data-id="${o.id}"] ${o.sel}`))?.focus?.({ preventScroll: true });
 });
 // キーボード(PC): / で検索、n で追加
 document.addEventListener('keydown', (e) => {
