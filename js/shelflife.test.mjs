@@ -80,17 +80,57 @@ t('規則: id は一意・パターンは正規表現として正しい・P と�
     assert.ok(!ids.has(r.id), r.id); ids.add(r.id);
     assert.doesNotThrow(() => new RegExp(r.m), r.id); if (r.x) assert.doesNotThrow(() => new RegExp(r.x), r.id);
     assert.ok(Number.isFinite(r.P) && r.P >= 0, r.id);
-    if (r.P) { assert.ok(r.c >= 0 && r.c <= 1, r.id); assert.ok(r.kd === '賞味' || r.kd === '消費', r.id); }
+    if (r.P) { assert.ok(r.c >= 0 && r.c <= 1, r.id); assert.ok(r.kd === undefined || r.kd === '賞味' || r.kd === '消費', r.id); }
     if (r.o) assert.ok(r.oc > 0 && r.oc <= 1, r.id);
     assert.ok(typeof r.b === 'string' && r.b.length > 0 && r.b.length < 60, r.id);
   }
   assert.ok(RULES.length >= 30, '規則は30種類以上');
 });
 t('retail: 10日以下は0.6、それ以上は0.65', () => { assert.equal(retail(8), 0.6); assert.equal(retail(10), 0.6); assert.equal(retail(11), 0.65); assert.equal(retail(365), 0.65); });
-t('サイズ: shelflife.js + shelflife-data.js は 40KB 以内(目安25KB)', () => {
+t('サイズ: shelflife.js + shelflife-data.js は 50KB 以内(当初の目安40KB。段階low用の規則を足して超過。gzipで約18KB)', () => {
   const kb = (f) => fs.statSync(new URL(f, import.meta.url)).size;
-  assert.ok(kb('./shelflife.js') + kb('./shelflife-data.js') < 40000, String(kb('./shelflife.js') + kb('./shelflife-data.js')));
+  assert.ok(kb('./shelflife.js') + kb('./shelflife-data.js') < 50000, String(kb('./shelflife.js') + kb('./shelflife-data.js')));
 });
+// ---- 段階(level)・要確認(critical)・null の理由 ----
+const L = (name, extra = {}, opts = { level: 'low' }) => predictExpiry({ name, today: TODAY, ...extra }, opts);
+t('level: 指定なしは high のみ(従来どおり)。mid/low を指定するとその段階以上を返す', () => {
+  assert.equal(P('牛乳 1000ml'), null); assert.equal(P('豆腐'), null); assert.equal(P('チョコレート'), null);
+  const a = L('牛乳 1000ml'); assert.ok(a && a.level === 'low' && a.days === 5 && a.kind === '賞味', JSON.stringify(a));
+  assert.equal(L('牛乳 1000ml', {}, { level: 'mid' }), null);
+  const c = L('日清 カップヌードル', {}, { level: 'high' }); assert.equal(c.level, 'high');
+  assert.equal(L('日清 カップヌードル', {}, { level: 'low' }).level, 'high', 'high の品は low 指定でも high のまま');
+  assert.throws(() => L('牛乳', {}, { level: 'x' }), RangeError);
+});
+t('level:low は「おおよそ」と basis に書く(high には書かない)。range は分かる品だけ', () => {
+  const m = L('食パン 6枚切'); assert.match(m.basis, /おおよそ/); assert.ok(m.days >= 2 && m.days <= 4, JSON.stringify(m));
+  const t = L('豆腐 絹'); assert.equal(t.level, 'low'); assert.match(t.basis, /おおよそ/); assert.match(t.range, /\d〜\d+日/);
+  assert.doesNotMatch(L('日清 カップヌードル').basis, /おおよそ/);
+});
+t('控えめな日数(短い側): 牛乳5日・豆腐4日・納豆8日以下・食パン3日・ポテチは3か月前後・チョコ/クッキーは半年前後・ペットボトル飲料は半年前後', () => {
+  const d = (n) => L(n).days;
+  assert.ok(d('納豆') <= 8 && d('納豆') >= 5); assert.ok(d('ポテトチップス うすしお') <= 120 && d('ポテトチップス') >= 60);
+  assert.ok(d('チョコレート') >= 150 && d('チョコレート') <= 260); assert.ok(d('クッキー') >= 150 && d('クッキー') <= 260);
+  assert.ok(d('お茶 500ml ペットボトル') >= 120 && d('お茶 500ml ペットボトル') <= 240);
+});
+t('麺: 手がかりが無い生/乾/冷凍不明の麺は最も短い側(生・チルド)で low、乾麺・パスタは長い', () => {
+  const u = L('うどん'); assert.ok(u && u.level === 'low' && u.days <= 10, JSON.stringify(u));
+  assert.ok(L('スパゲッティ 1.6mm 500g').days > 300); assert.ok(L('そうめん 乾麺').days > 150);
+});
+t('薬・サプリ・粉ミルクは critical:true・low・basis に「箱に…印字」。既定(level無し)では返さない', () => {
+  for (const n of ['ロキソニンS 12錠', 'ビタミンC サプリ', '明治ほほえみ 800g', 'ネイチャーメイド マルチビタミン']) {
+    const r = L(n); assert.ok(r, n); assert.equal(r.critical, true, n); assert.equal(r.level, 'low', n); assert.match(r.basis, /箱に印字されています。必ず箱の表示を確認してください/, n); assert.equal(P(n), null, n);
+  }
+  assert.equal(L('牛乳').critical, undefined);
+});
+t('null を返すのは期限が本当に無い品だけ(米・塩・砂糖・アイス・ワイン/焼酎など・おむつ・洗剤)。理由は matchRule(name).b', () => {
+  for (const n of ['お米 5kg', '食塩', '砂糖 上白糖 1kg', 'ハーゲンダッツ ストロベリー', '焼酎 いいちこ', 'ワイン 赤', 'おむつ Mサイズ', '片栗粉']) { assert.equal(L(n), null, n); const r = matchRule(n); assert.ok(r && r.P === 0 && !r.o && r.b.length > 10, n + ' ' + JSON.stringify(r && r.b)); }
+  assert.equal(L('キュキュット 食器用洗剤'), null); assert.equal(L('氷結 レモン').level, 'low');
+});
+t('開封後・冷凍庫も新しい段階の品に効く(牛乳は開封後2日・肉は冷凍)', () => {
+  assert.equal(L('牛乳', { opened: true }).days, 2);
+  assert.ok(L('冷凍餃子', { location: '冷凍庫' }).days >= 150);
+});
+t('level と minConf を併用すると両方満たすものだけ', () => { assert.equal(L('食パン', {}, { level: 'low', minConf: 0.9 }), null); assert.ok(L('食パン', {}, { level: 'low', minConf: 0.5 })); });
 // ---- 評価セットの一部(回帰) ----
 const REG = [
   ["農協 野菜Days フルーツ＆黄野菜100％", "パントリー", 180, 0, "www.meg-snow.com/products/detail.php?p=nokyo_fy200", "N"],
@@ -165,8 +205,8 @@ const REG = [
   ["明治おいしい牛乳 900ml", "冷蔵庫", 2, 3, "www.meiji.co.jp/meiji-shokuiku/know/keep/", "Y"],
   ["ﾀｶﾅｼ 低脂肪乳 1L", "冷蔵庫", 2, 3, "www.meiji.co.jp/meiji-shokuiku/know/keep/", "Y"],
   ["フレッシュ 北海道産生クリーム使用", "冷蔵庫", 90, 0, "www.meg-snow.com/products/detail.php?p=cream", "N"],
-  ["明治 ほほえみ らくらくキューブ 540g", "パントリー", 730, 0, "www.meiji.co.jp/corporate/pressrelease/2025/02_08/", "Y"],
-  ["明治ほほえみ 800g", "パントリー", 730, 0, "www.meiji.co.jp/corporate/pressrelease/2025/02_08/", "Y"],
+  ["明治 ほほえみ らくらくキューブ 540g", "パントリー", 730, 0, "www.meiji.co.jp/corporate/pressrelease/2025/02_08/", "N"],
+  ["明治ほほえみ 800g", "パントリー", 730, 0, "www.meiji.co.jp/corporate/pressrelease/2025/02_08/", "N"],
   ["豚バラ薄切り 300g", "冷蔵庫", 2, 1, "www.city.mito.lg.jp/site/gomi/91226.html", "Y"],
   ["牛こま切れ 200g", "冷蔵庫", 2, 1, "www.city.mito.lg.jp/site/gomi/91226.html", "Y"],
   ["コーンクリーム缶", "パントリー", 1095, 0, "www.maruha-nichiro.co.jp/inquiry/faq_exp.php", "Y"],
