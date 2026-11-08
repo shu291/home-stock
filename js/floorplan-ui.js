@@ -68,7 +68,7 @@ function dialog(id) {
 }
 
 // env: { sync(): createSync の入れ物, items(), status(): {ready, pending, error}, toast(msg, undo), save(item),
-//        rows(items): 品目の行のHTML, rowClick(button): 行の操作(−/＋・編集)をしたら true, edit(item), add(場所名), scan(場所名), ctx(): 追加先 }
+//        rows(items, ctx='loc'): 品目の行のHTML(ctx='cat' なら補助表示が置き場所), rowClick(button): 行の操作(−/＋・編集)をしたら true, edit(item), add(場所名), scan(場所名), ctx(): 追加先 }
 export function mountPlan(host, env) {
   const S = { scope: 'house', edit: false, sel: null, zoom: 1, pal: false, more: false, sheet: null };
   let drag = null, pending = false, dragMoved = false, own = 0, destroyed = false, msgT = 0, openerKey = '';
@@ -151,7 +151,8 @@ export function mountPlan(host, env) {
       + `<div class="fpw z1"><div class="fpc room${S.edit ? ' ed' : ''}" role="group" aria-label="${esc(room.name)}の間取り" style="--gx:${SPOT_GRID};--gy:${SPOT_GRID};--rw:${room.w};--rh:${room.h};--rc:var(--c-${rc}-fg)">${spots.map((s) => rectHtml(s, 'spot', sum.spots[s.id])).join('')}<div class="fpg" hidden></div></div></div>`
       + (!spots.length ? `<p class="sub fpnone">${S.edit ? '' : 'まだ収納場所がありません。「✏️ 編集」で、冷蔵庫や棚などの四角を置けます。'}</p>` : '')
       + toolbarHtml(L, sum) + (S.edit ? paletteHtml() : '')
-      + `<div class="row fpra"><button type="button" class="b p grow" data-a="addroom">＋ この部屋に追加</button></div>`
+      + `<section aria-labelledby="fpi-h"><div class="fpih"><h4 class="fph4" id="fpi-h">この部屋の品 <span class="fpcnt">${rs.count}品</span></h4><button type="button" class="b p" data-a="addroom">＋ この部屋に追加</button></div>`
+        + `<div class="fpsl fpri">${rs.items.length ? env.rows(rs.items, 'cat') : '<p class="sub fpnone">まだ品がありません。「＋ この部屋に追加」で入れます。</p>'}</div></section>`
       + `<section aria-labelledby="fpl-h"><h4 class="fph4" id="fpl-h">収納場所の一覧</h4><ul class="fpl">${spots.map((s) => rowHtml(s, 'spot', sum.spots[s.id])).join('')}`
       + `<li><button type="button" class="fprow" data-a="loose"><span class="ic" aria-hidden="true">📦</span><span class="fprn"><b>この部屋のその他の品</b><span class="sub">${lo.count}品 ・ 場所を細かく決めていない品</span>${estNote(lo)}</span><span class="bdg">${pills(lo, true)}</span><span class="chev" aria-hidden="true">›</span></button></li></ul></section>`;
   }
@@ -289,6 +290,7 @@ export function mountPlan(host, env) {
   // ---- クリック・キー ----
   host.addEventListener('click', (e) => {
     if (dragMoved) { dragMoved = false; return; }
+    const rb = e.target.closest('.fpri .it button'); if (rb && main.contains(rb)) { env.rowClick(rb); return; } // 部屋の品の行: −/＋・数量・編集
     const t = e.target.closest('[data-eid],[data-a],.fpc,.fpw'); if (!t || !main.contains(t)) return;
     if (t.dataset.eid) return activate(t.dataset.eid, t.dataset.k);
     const a = t.dataset.a;

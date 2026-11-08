@@ -276,8 +276,8 @@ input.bad{border:2px solid var(--hl-line)}
 .fpest{display:inline-block;font-size:.875rem;color:var(--mut);border:1px dashed var(--mut);border-radius:6px;padding:0 6px}
 .fpw{margin:8px 0}.fpw.zz{overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}
 .fpc{position:relative;width:calc(var(--z,1)*100%);aspect-ratio:24/var(--rows);background:var(--card);border-radius:12px;box-shadow:inset 0 0 0 2px var(--line-strong)}
-.fpc.room{--z:1;width:min(100%,calc(60vh*var(--rw)/var(--rh)));aspect-ratio:var(--rw)/var(--rh);margin:0 auto;box-shadow:inset 0 0 0 3px var(--rc)}
-@supports(height:1dvh){.fpc.room{width:min(100%,calc(60dvh*var(--rw)/var(--rh)))}}
+.fpc.room{--z:1;width:min(100%,calc(30vh*var(--rw)/var(--rh)));aspect-ratio:var(--rw)/var(--rh);margin:0 auto;box-shadow:inset 0 0 0 3px var(--rc)}
+@supports(height:1dvh){.fpc.room{width:min(100%,calc(30dvh*var(--rw)/var(--rh)))}}
 .fpc.ed{background-image:linear-gradient(to right,var(--line) 1px,transparent 1px),linear-gradient(to bottom,var(--line) 1px,transparent 1px);background-size:calc(100%/var(--gx)) calc(100%/var(--gy))}
 .fpr{position:absolute;box-sizing:border-box;border:2px solid var(--rf);background:var(--rb);color:var(--rf);border-radius:8px;cursor:pointer;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
 .fpc.ed .fpr{touch-action:none;cursor:grab}
@@ -338,3 +338,8 @@ dialog.fps{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:20;width:100%
 /* 新しい版の案内(ナビの上に出る。タップで読み込み直す) */
 #upd{position:fixed;left:16px;right:16px;bottom:calc(64px + env(safe-area-inset-bottom));z-index:30;display:flex;align-items:center;justify-content:space-between;gap:12px;background:#222;color:#fff;border-radius:12px;padding:8px 8px 8px 16px;font-size:.9375rem}
 #upd .b{min-height:44px}
+
+/* 部屋の詳細: この部屋の品(地図のすぐ下。タップした直後に見える) */
+.fpih{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:12px 0 0}.fpih .fph4{margin:0}.fpih .b{min-height:44px;white-space:nowrap}
+.fpcnt{font-weight:400;color:var(--mut);font-size:.875rem}
+.fpri{margin-top:4px}

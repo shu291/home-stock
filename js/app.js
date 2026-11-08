@@ -447,7 +447,7 @@ function renderList() {
 
 // ---------- 間取り(部屋と収納場所を四角で置く画面。js/floorplan-ui.js を使うときだけ読む) ----------
 let fpP = null, planCtl = null, planHost = null;
-const planRows = (list) => { const now = Date.now(); return list.map((i) => infoOf(i, now)).sort(SORT_CMP(now).std).map((x) => rowHtml(x, 'loc')).join(''); };
+const planRows = (list, ctx = 'loc') => { const now = Date.now(); return list.map((i) => infoOf(i, now)).sort(SORT_CMP(now).std).map((x) => rowHtml(x, ctx)).join(''); };
 const addAt = (name) => setCtx({ location: name, category: '', sub: '', sticky: true }); // その場所を追加先(固定)にする
 const planEnv = {
   sync: () => sync, items: () => items, ctx: () => addCtx,
@@ -1757,7 +1757,7 @@ renderBars(); // 固定していた追加先があれば、ナビの＋の読み
   });
 })().catch((e) => { $('#view').innerHTML = `<div class="empty">起動に失敗: ${esc(e.message)}</div>`; });
 // ---------- アプリの更新 ----------
-const APP_VERSION = 'v25'; // sw.js のキャッシュ名(hs-vNN)と合わせる
+const APP_VERSION = 'v26'; // sw.js のキャッシュ名(hs-vNN)と合わせる
 // 新しい版が入ったら案内を出す(開いている画面は古いまま動き続けるので、押して読み込み直してもらう)
 function updateBanner() {
   if ($('#upd')) return;
