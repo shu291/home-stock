@@ -610,6 +610,7 @@ function renderFamily(v) {
   <p class="sub">予測は標準的な期間にもとづく目安です。パッケージの表示と同じとは限らず、「おおよそ」「目安」は特に外れやすい予測です。パッケージの表示があれば必ずそちらを使ってください。この設定はこの端末だけのものです。「予測で入れる」ボタンは、この設定に関わらず、いちばんゆるい段階まで試します。</p>
   <button type="button" class="b wide" id="xbulk">期限が未設定の品に、まとめて予測を入れる</button>
   <h4 class="xh">予測の的中率</h4><div id="xs" role="status"></div><p class="sub">予測・前回の期限を、実際の日付に直した品と、「合っていた」を押した品の結果です(この端末だけの記録)。段階ごとに分けて数えます。目安を確かめるための記録で、精度を保証するものではありません。「長すぎ」は、予測が実際より長かった誤りです。</p><button class="b" id="xs-reset">記録をリセット</button></div>
+  <div class="card"><h3>アプリのバージョン</h3><p class="sub">いまの版: <b>${APP_VERSION}</b>。更新されないときは、下のボタンで、この端末に覚えさせた古い版を消して、最新を取り直します(在庫のデータは消えません)。</p><button class="b" id="upd-now">最新版に更新する</button></div>
   <div class="card"><h3>レシートの修正の学習</h3><p class="sub">レシートの読み間違いを直すと、この端末が覚えて、次から自動で直します(この端末の中だけに保存されます)。覚えた数: <span id="fxn">${fixLoad().length}</span>件</p><button class="b" id="fx-reset" ${fixLoad().length ? '' : 'disabled'}>修正の学習をリセット</button></div>
   ${cloud ? '<div class="danger"><button class="b" id="out">ログアウト</button></div>' : ''}`;
   const copy = (t, m) => (navigator.clipboard?.writeText(t) ?? Promise.reject()).then(() => toast(m), () => toast('コピーできませんでした。コードを長押しして選んでください'));
@@ -617,6 +618,7 @@ function renderFamily(v) {
   $('#cp')?.addEventListener('click', () => copy(h.id, 'コードをコピーしました'));
   $('#cl')?.addEventListener('click', () => copy(link, 'リンクをコピーしました'));
   $('#sh')?.addEventListener('click', () => (navigator.share ? navigator.share({ title: 'うちの在庫', text: `「うちの在庫」に参加してください。開いてログインすると家族コード(${h.id})が入ります。`, url: link }).catch(() => {}) : copy(link, 'リンクをコピーしました。LINEなどに貼ってください')));
+  $('#upd-now').onclick = () => { $('#upd-now').disabled = true; $('#upd-now').textContent = '更新中…'; forceUpdate(); };
   $('#fx-reset').onclick = () => { const was = fixLoad(); fixSave([]); $('#fxn').textContent = '0'; $('#fx-reset').disabled = true; toast('修正の学習をリセットしました', () => { fixSave(was); renderFamily(v); }); };
   const xsPaint = () => {
     const x = xsLoad(), by = x.by || {}, pc = (b) => Math.round((b.hit / b.n) * 100);
@@ -1754,4 +1756,36 @@ renderBars(); // 固定していた追加先があれば、ナビの＋の読み
     render();
   });
 })().catch((e) => { $('#view').innerHTML = `<div class="empty">起動に失敗: ${esc(e.message)}</div>`; });
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+// ---------- アプリの更新 ----------
+const APP_VERSION = 'v25'; // sw.js のキャッシュ名(hs-vNN)と合わせる
+// 新しい版が入ったら案内を出す(開いている画面は古いまま動き続けるので、押して読み込み直してもらう)
+function updateBanner() {
+  if ($('#upd')) return;
+  const b = document.createElement('div'); b.id = 'upd'; b.setAttribute('role', 'status');
+  b.innerHTML = '<span>新しい版があります</span><button type="button" class="b p">更新する</button>';
+  b.querySelector('button').onclick = () => location.reload();
+  document.body.appendChild(b);
+}
+// 端末に覚えさせた古い版をすべて消して、最新を取り直す(在庫のデータは消えない。クラウドの在庫は保存済み)
+async function forceUpdate() {
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map((r) => r.unregister()));
+    const keys = await caches.keys(); await Promise.all(keys.map((k) => caches.delete(k)));
+  } catch { /* 消せなくても読み込み直す */ }
+  location.reload();
+}
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then((reg) => {
+    const had = !!navigator.serviceWorker.controller; // 初回インストールは案内しない
+    reg.addEventListener('updatefound', () => {
+      const w = reg.installing;
+      w?.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) updateBanner(); });
+    });
+    if (had) navigator.serviceWorker.addEventListener('controllerchange', updateBanner);
+    // ホーム画面のアプリは、閉じずに戻ってくるだけだと更新を確認しない。戻るたびに確認する
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+    reg.update().catch(() => {});
+    window.__hsUpdate = () => reg.update();
+  }).catch(() => {});
+}
