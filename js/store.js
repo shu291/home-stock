@@ -1,4 +1,5 @@
 import { firebaseConfig } from './config.js';
+import { DELETE, applyPatch, parseLayout } from './floorplan.js';
 
 export const CLOUD = !!(firebaseConfig && firebaseConfig.apiKey);
 const V = '10.12.2';
@@ -8,9 +9,11 @@ const newCode = () => Array.from(crypto.getRandomValues(new Uint8Array(10)), (b)
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
 
 // ---- ローカル(お試し)ストア ----
-function localStore() {
-  const KEY = 'hs-items';
+export function localStore() {
+  const KEY = 'hs-items', LKEY = 'hs-layout';
   let listener = null;
+  const lListeners = new Set();
+  const loadL = () => { try { return parseLayout(JSON.parse(localStorage.getItem(LKEY))); } catch { return parseLayout(null); } };
   const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } };
   const save = (a) => { localStorage.setItem(KEY, JSON.stringify(a)); listener && listener(a); };
   return {
@@ -23,13 +26,20 @@ function localStore() {
       i >= 0 ? (a[i] = rec) : a.push(rec); save(a);
     },
     async remove(id) { save(load().filter((x) => x.id !== id)); },
+    // 間取り: localStorage 'hs-layout' に layout 全体を保存。patch は diffLayout のドット記法(DELETE=消す)
+    subscribeLayout(cb) { const f = (l) => cb(l, { pending: false }); lListeners.add(f); f(loadL()); return () => { lListeners.delete(f); }; },
+    async saveLayoutPatch(patch) {
+      const l = applyPatch(loadL(), patch);
+      localStorage.setItem(LKEY, JSON.stringify(l)); lListeners.forEach((f) => f(l));
+    },
     async signIn() {}, async signOut() {}, async createHousehold() {}, async joinHousehold() {},
   };
 }
 
 // ---- Firebase ストア ----
-async function cloudStore() {
-  const [appM, authM, fs] = await Promise.all([import(G('app')), import(G('auth')), import(G('firestore'))]);
+// mods は注入口(テスト用: { appM, authM, fs } を渡すと gstatic を読まない)
+export async function cloudStore(mods) {
+  const [appM, authM, fs] = mods ? [mods.appM, mods.authM, mods.fs] : await Promise.all([import(G('app')), import(G('auth')), import(G('firestore'))]);
   const app = appM.initializeApp(firebaseConfig);
   const auth = authM.getAuth(app);
   let db;
@@ -80,6 +90,25 @@ async function cloudStore() {
       await fs.setDoc(fs.doc(items(), id), rec);
     },
     async remove(id) { await fs.deleteDoc(fs.doc(items(), id)); },
+    // 間取りは家のドキュメント households/{hid} の `layout` フィールドに持つ(1ドキュメント1MB以内・数十KB)。
+    // 家のドキュメントの update は「メンバーなら任意のフィールド」を許可済みなので、firestore.rules の変更は不要。
+    // cb(layout, {pending: 送信待ちあり})。未設定なら空の layout
+    subscribeLayout(cb, onErr) {
+      if (!hid) { onErr?.(new Error('no household')); return () => {}; }
+      return fs.onSnapshot(fs.doc(db, 'households', hid), { includeMetadataChanges: true },
+        (s) => cb(parseLayout(s.data()?.layout), { pending: s.metadata.hasPendingWrites }),
+        (e) => onErr?.(e));
+    },
+    // patch: { 'layout.rooms.r1': {...}, 'layout.spots.s9': DELETE, ... }(diffLayout の結果)。DELETE は deleteField() に、undefined は落とす
+    async saveLayoutPatch(patch) {
+      if (!hid) throw new Error('no household');
+      const upd = {};
+      for (const [k, v] of Object.entries(patch || {})) {
+        if (v === undefined || !k.startsWith('layout.')) continue;
+        upd[k] = v === DELETE ? fs.deleteField() : JSON.parse(JSON.stringify(v));
+      }
+      if (Object.keys(upd).length) await fs.updateDoc(fs.doc(db, 'households', hid), upd);
+    },
   };
 }
 

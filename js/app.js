@@ -3,7 +3,8 @@ import { norm, parseReceipt, parseReceiptMeta, checkTotal } from './parse.js';
 import { ocr, warmupOcr } from './ocr.js';
 import { gmailAvailable, fetchOrders } from './gmail.js';
 import { scan, lookupName, canonCode } from './barcode.js';
-import { CATS, LOCS, LEGACY_CATEGORY, canonCategory, canonLocation, catInfo, locInfo, categoryOptions, subOptions, locationOptions } from './taxonomy.js';
+import { CATS, LOCS, LEGACY_CATEGORY, canonCategory, canonLocation, catInfo, locInfo, categoryOptions, subOptions, locationOptions as baseLocationOptions } from './taxonomy.js';
+import { createSync, parseLayout, locKey, roomKind, spotKind } from './floorplan.js';
 import { guessClass } from './category.js';
 import { plan, daysLeft, expiryDays, withLog, autoClassify, EXPIRY_DAYS, MIN_EVENTS, MIN_SPAN_DAYS } from './optimize.js';
 
@@ -12,6 +13,7 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const SRC = { amazon: 'Amazon', rakuten: '楽天', receipt: 'レシート', paste: '貼り付け', manual: '手入力', barcode: 'バーコード' };
 
 let store, state = { user: null, household: null }, items = [], unsub = null, lastSig = '', syncMsg = '';
+let sync = createSync(async () => {}), layoutUnsub = null, layoutHid = null, layoutReady = false, layoutErr = false, pendI = false, pendL = false, lastLKey = '', lv = 0; // 間取り(sync.layout が画面用の補正済みの間取り)
 let tab = 'stock', q = '', filterKey = ''; // 在庫一覧の検索語と、要約チップの絞り込み('' / 'low' / 'exp')
 let draft = []; // 取り込み確認中の候補
 let receipts = []; // 確認中のレシートごとの {store, date, total, tax, adjust}。draft の rid が添字
@@ -23,7 +25,7 @@ const toast = (m, undo) => {
   const t = $('#toast'); clearTimeout(toastT); t.textContent = '';
   if (undo) { const b = document.createElement('button'); b.textContent = '元に戻す'; b.onclick = async () => { hideToast(); try { await undo(); toast('元に戻しました'); } catch {} }; t.append(b); }
   const sp = document.createElement('span'); sp.className = 'm'; sp.textContent = m; t.append(sp);
-  t.classList.add('on'); try { if (!t.matches(':popover-open')) t.showPopover?.(); } catch {}
+  t.classList.add('on'); try { if (t.matches(':popover-open')) t.hidePopover(); t.showPopover?.(); } catch {} // 出し直して最前面へ(先に出ていたトーストが、あとから開いたダイアログの下に隠れないように)
   toastT = setTimeout(hideToast, undo ? 8000 : 2600);
 };
 // 保存に失敗したら理由を出す(これが無いと「追加したのに増えない」原因が見えない)
@@ -38,14 +40,14 @@ const undismiss = async (ks) => { try { const o = dismissed(); ks.forEach((k) =>
 const dismiss = (k) => { try { localStorage.setItem(DKEY, JSON.stringify({ ...dismissed(), [k]: Date.now() })); } catch {} };
 // 分析結果は品目が変わるか1時間たつまで使い回す
 let planMemo = { sig: '', v: null };
-const getPlan = () => { const sig = lastSig + Math.floor(Date.now() / 36e5); return planMemo.sig === sig ? planMemo.v : (planMemo = { sig, v: plan(items, Date.now(), { locs: locationOptions(items) }) }).v; };
+const getPlan = () => { const sig = lastSig + Math.floor(Date.now() / 36e5) + ':' + lv; return planMemo.sig === sig ? planMemo.v : (planMemo = { sig, v: plan(items, Date.now(), { locs: locationOptions(items) }) }).v; };
 const etaText = (d) => (d < 1 ? 'あと1日未満' : d <= 180 ? `あと約${Math.round(d)}日` : '半年以上もちそう');
 
 // ---------- 画面 ----------
 const JOIN = (new URLSearchParams(location.search).get('join') || '').trim().toUpperCase(); // 家族の誘いリンク ?join=コード
 const clearJoin = () => { try { history.replaceState(null, '', location.pathname + location.hash); } catch {} };
 const SORTS = [['std', '並び: 足りない順'], ['expiry', '並び: 期限が近い順'], ['eta', '並び: なくなりそうな順'], ['name', '並び: 名前順'], ['recent', '並び: 最近変えた順']];
-const VIEWS = [['loc', '置き場所別'], ['cat', '分類別'], ['flat', 'すべて']];
+const VIEWS = [['loc', '置き場所別'], ['cat', '分類別'], ['flat', 'すべて'], ['plan', '間取り']];
 // 端末ごとの見かた(hs-view=表示のしかた / hs-sort=並び / hs-fold=たたんだ見出し)。保存できなくても動く
 let sortKey = 'std', viewMode = 'loc', foldS = { cat: new Set(), loc: new Set() };
 try {
@@ -57,6 +59,31 @@ try {
   for (const k of ['cat', 'loc']) if (Array.isArray(o?.[k])) foldS[k] = new Set(o[k].filter((x) => typeof x === 'string'));
 } catch {}
 const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+
+// ---------- 間取りの名前を、置き場所の選択肢に足す ----------
+// 収納場所の名前・部屋の名前は、そのまま品目の location 文字列になる。選択肢は 既定+使用中+間取り の合成(部屋ごとにまとめて出す)
+const byPos = (a, b) => a.y - b.y || a.x - b.x;
+const planGroups = () => { const L = sync.layout; return Object.values(L.rooms).sort(byPos).map((r) => ({ room: r.name, names: [r.name, ...Object.values(L.spots).filter((x) => x.room === r.id).sort(byPos).map((x) => x.name)] })); };
+const locationOptions = (its) => { const base = baseLocationOptions(its), have = new Set(base); return [...base, ...planGroups().flatMap((g) => g.names).filter((n) => !have.has(n) && have.add(n))]; };
+let pidx = { L: null, m: new Map() };
+const planIdx = () => { // 名前 → { icon, room }(部屋名は収納場所だけ)
+  const L = sync.layout; if (pidx.L === L) return pidx.m;
+  const m = new Map();
+  for (const r of Object.values(L.rooms)) m.set(locKey(r.name), { icon: roomKind(r.kind).icon, room: '' });
+  for (const x of Object.values(L.spots)) if (L.rooms[x.room]) m.set(locKey(x.name), { icon: spotKind(x.kind).icon, room: L.rooms[x.room].name });
+  return (pidx = { L, m }).m;
+};
+const locInfoP = (l, hint) => { const li = locInfo(l, hint); return li.custom ? { ...li, icon: planIdx().get(locKey(li.name))?.icon || li.icon } : li; };
+const roomOf = (name) => planIdx().get(locKey(name))?.room || '';
+// 置き場所の <option>。間取りがあれば部屋ごとの <optgroup>(値は名前のまま)。sel=true は選択中に selected を付ける
+function locHtml(arr, v, sel) {
+  const gs = planGroups(), opt = (x, label) => `<option value="${esc(x)}"${sel && x === v ? ' selected' : ''}>${esc(label || x)}</option>`, none = '<option value="">未設定</option>';
+  if (!gs.length) return none + arr.map((x) => opt(x)).join('');
+  const have = new Set(arr), used = new Set();
+  const groups = gs.map((g) => { const ns = g.names.filter((n) => have.has(n) && !used.has(n)); ns.forEach((n) => used.add(n)); return ns.length ? `<optgroup label="${esc(g.room)}">${ns.map((n) => opt(n, n === g.room ? `${n}(部屋全体)` : '')).join('')}</optgroup>` : ''; }).join('');
+  const rest = arr.filter((x) => !used.has(x));
+  return none + groups + (rest.length ? `<optgroup label="ほかの場所">${rest.map((x) => opt(x)).join('')}</optgroup>` : '');
+}
 
 // ---------- 追加先(連続して追加するあいだ保つ、置き場所と分類) ----------
 // 選んだ項目だけが新しい品の初期値になる(選ばなかった項目は自動分類)。優先: 品目ごとに手で選んだ値 > 追加先 > 自動分類
@@ -110,8 +137,11 @@ function ctxSheet(kind) {
   const draw = () => {
     if (kind === 'loc') {
       const cur = addCtx.location, ls = locationOptions(items); if (cur && !ls.includes(cur)) ls.push(cur);
-      s.innerHTML = `<h3 id="acs-h" tabindex="-1">置き場所を選ぶ</h3><p class="sub">選んだ場所に、これから追加する品が入ります。</p>
-        <div class="chips" role="group" aria-label="置き場所">${chip('', '✨ おまかせ', !cur)}${ls.map((l) => chip(l, `${locInfo(l).icon} ${esc(l)}`, l === cur)).join('')}</div>
+      const gs = planGroups(), used = new Set(), lc = (l, room) => chip(l, `${locInfoP(l).icon} ${esc(l)}${l === room ? '(部屋全体)' : ''}`, l === cur);
+      const grouped = gs.map((g) => { const ns = g.names.filter((n) => ls.includes(n) && !used.has(n)); ns.forEach((n) => used.add(n)); return ns.length ? `<h4 class="fpgh">${esc(g.room)}</h4><div class="chips" role="group" aria-label="${esc(g.room)}の置き場所">${ns.map((n) => lc(n, g.room)).join('')}</div>` : ''; }).join('');
+      const rest = ls.filter((l) => !used.has(l));
+      s.innerHTML = `<h3 id="acs-h" tabindex="-1">置き場所を選ぶ</h3><p class="sub">選んだ場所に、これから追加する品が入ります。${gs.length ? '間取りの場所は、部屋ごとに並んでいます。' : ''}</p>
+        <div class="chips" role="group" aria-label="置き場所">${chip('', '✨ おまかせ', !cur)}${gs.length ? '' : rest.map((l) => lc(l)).join('')}</div>${grouped}${gs.length && rest.length ? `<h4 class="fpgh">ほかの場所</h4><div class="chips" role="group" aria-label="ほかの置き場所">${rest.map((l) => lc(l)).join('')}</div>` : ''}
         <label for="acs-t">ほかの場所(自由に入力)</label><div class="row"><input id="acs-t" enterkeyhint="done" placeholder="例: 物置" autocomplete="off"><button type="button" class="b" id="acs-ok">決定</button></div>${note}`;
     } else if (stage === 'sub') {
       const cur = addCtx.category === pick ? addCtx.sub : '', ss = subOptions(pick, items), ci = catInfo(pick);
@@ -145,8 +175,8 @@ function ctxSheet(kind) {
 function classForm({ fC, fS, fL, getName, id, init = {}, useCtx, onChange }) {
   const pin = { c: !!init.category, l: !!init.location }; pin.s = pin.c || !!init.sub;
   const src = { c: pin.c ? (init.auto ? 'auto' : 'hand') : '', s: '', l: pin.l ? (init.auto ? 'auto' : 'hand') : '' }, touched = { c: false, s: false, l: false };
-  const fill = (sel, list, v) => { const a = !v || list.includes(v) ? list : [...list, v], h = '<option value="">未設定</option>' + a.map((x) => `<option>${esc(x)}</option>`).join(''); if (sel.dataset.k !== h) { sel.innerHTML = h; sel.dataset.k = h; } sel.value = v || ''; };
-  fill(fC, categoryOptions(items), init.category || ''); fill(fS, subOptions(init.category || '', items), init.sub || ''); fill(fL, locationOptions(items), init.location || '');
+  const fill = (sel, list, v, mk) => { const a = !v || list.includes(v) ? list : [...list, v], h = mk ? mk(a, v) : '<option value="">未設定</option>' + a.map((x) => `<option>${esc(x)}</option>`).join(''); if (sel.dataset.k !== h) { sel.innerHTML = h; sel.dataset.k = h; } sel.value = v || ''; };
+  fill(fC, categoryOptions(items), init.category || ''); fill(fS, subOptions(init.category || '', items), init.sub || ''); fill(fL, locationOptions(items), init.location || '', locHtml);
   const recompute = () => {
     const x = useCtx ? addCtx : {}, catX = pin.c ? fC.value : x.category || '', subX = pin.s ? fS.value : !pin.c && x.category ? x.sub || '' : '', locX = pin.l ? fL.value : x.location || '';
     const r = autoClassify({ id, name: getName(), category: catX, sub: subX, location: locX }, items, { locs: locationOptions(items) });
@@ -154,7 +184,7 @@ function classForm({ fC, fS, fL, getName, id, init = {}, useCtx, onChange }) {
     if (!pin.c) src.c = catX ? 'ctx' : cat ? 'auto' : '';
     if (!pin.s) src.s = subX ? 'ctx' : sub ? 'auto' : '';
     if (!pin.l) src.l = locX ? 'ctx' : loc ? 'auto' : '';
-    fill(fC, categoryOptions(items), cat); fill(fS, subOptions(cat, items), sub); fill(fL, locationOptions(items), loc);
+    fill(fC, categoryOptions(items), cat); fill(fS, subOptions(cat, items), sub); fill(fL, locationOptions(items), loc, locHtml);
     onChange?.();
   };
   const hand = (k) => { touched[k] = true; pin[k] = true; src[k] = 'hand'; if (init.auto) src.c = src.l = 'hand'; };
@@ -186,7 +216,8 @@ function render() {
   $('#addnav').hidden = !state.household;
   const v = $('#view');
   // 在庫タブは検索欄を作り直さない(入力中・日本語変換中に消えるため)。一覧だけ更新する
-  if (state.household && tab === 'stock' && items.length && $('#lst') && $('#q')) return renderList();
+  if (tab !== 'stock' || !state.household) destroyPlan();
+  if (state.household && tab === 'stock' && (items.length || viewMode === 'plan') && $('#lst') && $('#q')) return renderList();
   if (!state.user) return (v.innerHTML = `<div class="empty"><p>家族みんなで使う在庫管理</p>${JOIN ? '<p class="sub">家族に誘われています。ログインすると、参加の画面に進みます。</p>' : ''}<button class="b p" id="login">Googleでログイン</button></div>`, $('#login').onclick = () => store.signIn());
   if (!state.household) return renderSetup(v);
   ({ stock: renderStock, shop: renderShop, ai: renderAi, import: renderImport, family: renderFamily })[tab](v);
@@ -208,7 +239,6 @@ function renderSetup(v) {
 // −/＋ を押した直後は並び順を保つ(押した品が「残りわずか」で先頭へ飛び、次のタップが別の品に当たるのを防ぐ)。subOrder: 固定中の小分類の順
 let hold = { until: 0, ids: [], subOrder: new Map() };
 let tmpClosed = new Set(); // 絞り込み中に開閉した見出し(保存しない。絞り込みが変わると戻る)
-let idMap = new Map();
 const FILTERS = [['', 'all', 'ぜんぶ'], ['low', 'low', '足りない'], ['exp', 'exp', '期限が近い']];
 const UNCAT = { name: '未分類', icon: '🏷️', color: 'gray' }, NOLOC = { name: '置き場所なし', icon: '📍' };
 const CHEV = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -218,7 +248,7 @@ function infoOf(i, now) {
   const d = expiryDays(i, now), low = isLow(i), raw = String(i.category ?? '').trim();
   const soft = isSoft(i), rank = d !== null && d < 0 && !soft ? 0 : low && i.qty <= 0 ? 1 : low ? 2 : d !== null && d <= EXPIRY_DAYS ? 3 : 9; // 状態の重さ(「おおよそ」の予測は、切れていても強い扱いにしない)
   const cat = canonCategory(raw, LEGACY_CATEGORY[raw] ? guessClass(i.name).category : ''), loc = canonLocation(i.location, i.name);
-  return { i, d, low, rank, soft, near: d !== null && d <= EXPIRY_DAYS, cat, ci: catInfo(cat), loc, li: locInfo(loc), sub: String(i.sub ?? '').trim() };
+  return { i, d, low, rank, soft, near: d !== null && d <= EXPIRY_DAYS, cat, ci: catInfo(cat), loc, li: locInfoP(loc), sub: String(i.sub ?? '').trim() };
 }
 // 予測・前回の期限は「(予測)」「(目安)」「(おおよそ)」「(前回から)」を併記し、期限切れは実際の表示より控えめな文言にする(おおよそは、さらに控えめ)
 const pillOf = (x) => { const est = estSrc(x.i.expirySrc), tag = est ? tagOf(x.i.expirySrc, x.i.expiryLevel) : '', sfx = est ? `(${tag})` : '';
@@ -278,8 +308,8 @@ function groupByLoc(list) {
   const out = [];
   for (const k of [...LOCS, ...extra, '']) {
     const a = by.get(k); if (!a) continue;
-    const li = k ? locInfo(k) : NOLOC;
-    out.push({ key: li.name, name: li.name, icon: li.icon, place: true, none: !k, items: a, hint: k ? '' : '置き場所をつけると、冷蔵庫など場所ごとに見られます。' });
+    const li = k ? locInfoP(k) : NOLOC;
+    out.push({ key: li.name, name: li.name, room: k ? roomOf(k) : '', icon: li.icon, place: true, none: !k, items: a, hint: k ? '' : '置き場所をつけると、冷蔵庫など場所ごとに見られます。' });
   }
   return out;
 }
@@ -289,21 +319,23 @@ function groupHtml(g, n, ctx, closed) {
   const body = g.subs ? g.subs.map(([sn, arr]) => `<h4 class="sh">${esc(sn)}<span>${arr.length}品</span></h4>${arr.map((x) => rowHtml(x, ctx)).join('')}`).join('') : g.items.map((x) => rowHtml(x, ctx)).join('');
   const nx = g.items.filter(needsExp).length, xb = nx ? `<div class="gx"><button type="button" class="gxb" data-gx="${esc(g.key)}" data-gn="${g.none ? '1' : ''}" aria-label="${esc(g.name)}の、期限が未設定の${nx}品に期限を入れる"><span class="gxn">⏰ 期限なし ${nx}</span><span class="gxt">期限を入れる ›</span></button></div>` : '';
   const add = g.none ? '' : `<button type="button" class="gadd" data-gadd="${esc(g.key)}" aria-label="${esc(g.name)}に品を追加"><span aria-hidden="true">＋</span><span class="gat">追加</span></button>`;
-  return `<section class="lg" style="${colors}"><div class="gw"><h3 class="gh"><button data-fold="${esc(g.key)}" aria-expanded="${!shut}" aria-controls="${id}"><span class="ic" aria-hidden="true">${g.icon}</span><span class="gn">${esc(g.name)}<span class="ct">${g.items.length}品</span></span><span class="gr"><span class="bdg">${nl ? `<span class="hb low">足りない ${nl}</span>` : ''}${ne ? `<span class="hb exp">期限 ${ne}</span>` : ''}</span><span class="chev" aria-hidden="true">${CHEV}</span></span></button></h3>${add}</div>`
+  return `<section class="lg" style="${colors}"><div class="gw"><h3 class="gh"><button data-fold="${esc(g.key)}" aria-expanded="${!shut}" aria-controls="${id}"><span class="ic" aria-hidden="true">${g.icon}</span><span class="gn">${g.room ? `<span class="gpr">${esc(g.room)} › </span>` : ''}${esc(g.name)}<span class="ct">${g.items.length}品</span></span><span class="gr"><span class="bdg">${nl ? `<span class="hb low">足りない ${nl}</span>` : ''}${ne ? `<span class="hb exp">期限 ${ne}</span>` : ''}</span><span class="chev" aria-hidden="true">${CHEV}</span></span></button></h3>${add}</div>`
     + `<div class="gbody" id="${id}" ${shut ? 'hidden' : ''}>${g.hint ? `<p class="gnote">${g.hint}</p>` : ''}${xb}${body}</div></section>`;
 }
 
 function renderStock(v) {
-  if (!items.length) {
-    v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="empty"><div class="big" aria-hidden="true">📦</div><p class="tt">まだ登録がありません</p><p>最初の1品を追加してみましょう。</p><button class="b p" id="e-add">品目を追加</button><br><button class="b" id="e-imp">レシートやバーコードでまとめて追加</button></div>`;
+  destroyPlan();
+  if (!items.length && viewMode !== 'plan') {
+    v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="empty"><div class="big" aria-hidden="true">📦</div><p class="tt">まだ登録がありません</p><p>最初の1品を追加してみましょう。</p><button class="b p" id="e-add">品目を追加</button><br><button class="b" id="e-imp">レシートやバーコードでまとめて追加</button><br><button class="b" id="e-plan">🏠 間取りを作る(部屋と収納場所)</button></div>`;
     $('#e-add').onclick = () => editDialog(); $('#e-imp').onclick = () => { tab = 'import'; render(); };
+    $('#e-plan').onclick = () => { viewMode = 'plan'; lsSet('hs-view', viewMode); render(); };
     return;
   }
   v.innerHTML = `<h2 class="vh">在庫一覧</h2><div class="srow"><div class="sw"><input id="q" type="search" enterkeyhint="search" placeholder="さがす(ひらがなでもOK)" aria-label="品名でさがす" autocomplete="off" value="${esc(q)}"><button class="x" id="qx" aria-label="入力を消す" ${q ? '' : 'hidden'}>×</button></div><button class="b" id="scan" aria-label="バーコードで追加">📷</button></div>
   <div class="sum" id="sum" role="group" aria-label="状態でしぼりこむ">${FILTERS.map(([f, c, l]) => `<button class="sc ${c}" data-f="${f}" aria-pressed="false"><span class="n"></span><span class="l">${l}</span></button>`).join('')}</div>
   <div class="seg" id="segw" role="group" aria-label="表示のしかた">${VIEWS.map(([k, t]) => `<button data-mode="${k}" aria-pressed="false">${t}</button>`).join('')}</div>
   <div class="tools"><select id="srt" aria-label="並び替え">${SORTS.map(([k, t]) => `<option value="${k}">${t}</option>`).join('')}</select><button class="fold" id="foldall"></button></div>
-  <div class="filt" id="filt" hidden><span class="t" id="filt-t" role="status"></span><button class="b" data-clear>解除</button></div><div id="lst"></div>`;
+  <div class="filt" id="filt" hidden><span class="t" id="filt-t" role="status"></span><button class="b" data-clear>解除</button></div><div id="lst"></div><div id="fp" hidden></div>`;
   const reset = () => { hold.until = 0; tmpClosed = new Set(); };
   const clearAll = () => { q = filterKey = ''; $('#q').value = ''; $('#qx').hidden = true; reset(); renderList(); $('#sum [data-f=""]').focus({ preventScroll: true }); };
   $('#q').oninput = (e) => { q = e.target.value; $('#qx').hidden = !q; reset(); renderList(); };
@@ -311,7 +343,9 @@ function renderStock(v) {
   $('#sum').onclick = (e) => { const b = e.target.closest('[data-f]'); if (!b) return; filterKey = b.dataset.f === filterKey ? '' : b.dataset.f; reset(); renderList(); };
   $('#segw').onclick = (e) => {
     const b = e.target.closest('[data-mode]'); if (!b || b.dataset.mode === viewMode) return;
-    viewMode = b.dataset.mode; lsSet('hs-view', viewMode); reset(); renderList();
+    viewMode = b.dataset.mode; lsSet('hs-view', viewMode); reset();
+    if (!items.length) return render(); // 品目が空のとき、間取りから戻ると「まだ登録がありません」の画面にする
+    renderList();
     const y = $('#sum').getBoundingClientRect().top + scrollY - 8; if (scrollY > y) scrollTo(0, Math.max(0, y)); // 一覧の先頭が見える所まで戻す
   };
   $('#srt').onchange = (e) => { sortKey = e.target.value; lsSet('hs-sort', sortKey); reset(); renderList(); };
@@ -329,17 +363,22 @@ function renderStock(v) {
     if (t.dataset.gx !== undefined) { const k = t.dataset.gn ? '' : t.dataset.gx; return expiryRound(viewMode === 'loc' ? { loc: k, label: t.dataset.gx } : { cat: k, label: t.dataset.gx }); } // 見出しの「期限なし N」: その場所/分類の期限未設定の品を1品ずつ
     if (t.dataset.fold !== undefined) { setOpen(t, t.getAttribute('aria-expanded') !== 'true'); saveFold(); syncFoldBtn(); return; }
     if (t.dataset.clear !== undefined) return clearAll();
-    const row = t.closest('.it'), it = row && idMap.get(row.dataset.id); if (!it) return;
-    if (t.dataset.edit !== undefined) editDialog(it);
-    else if (t.dataset.q !== undefined) editDialog(it, null, 'q');
-    else if (t.dataset.d) {
-      const qty = Math.max(0, it.qty + +t.dataset.d); if (qty === it.qty) return;
-      hold.until = Date.now() + 6000;
-      saveQty(it, { ...it, qty }).catch(() => {});
-      toast(`${it.name}: ${it.qty} → ${qty}`, () => save(it));
-    }
+    rowAction(t);
   };
   renderList();
+}
+// 品目の行のボタン(編集・数量・−/＋)。在庫の一覧と、間取りの収納場所のシートで共通。操作したら true
+function rowAction(t) {
+  const row = t.closest('.it'), it = row && items.find((x) => x.id === row.dataset.id); if (!it) return false;
+  if (t.dataset.edit !== undefined) editDialog(it);
+  else if (t.dataset.q !== undefined) editDialog(it, null, 'q');
+  else if (t.dataset.d) {
+    const qty = Math.max(0, it.qty + +t.dataset.d); if (qty === it.qty) return true;
+    hold.until = Date.now() + 6000;
+    saveQty(it, { ...it, qty }).catch(() => {});
+    toast(`${it.name}: ${it.qty} → ${qty}`, () => save(it));
+  }
+  return true;
 }
 
 // 見出しの開閉(一覧は作り直さない=フォーカスもスクロールも動かない)。絞り込み中は保存しない
@@ -360,9 +399,14 @@ function syncFoldBtn() {
 }
 
 function renderList() {
+  const plan = viewMode === 'plan';
+  $('#segw').querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', b.dataset.mode === viewMode));
+  for (const e of ['.srow', '#sum', '.tools', '#lst']) $(e).hidden = plan; // 間取りには、検索・並び替え・要約チップは使わない
+  $('#fp').hidden = !plan;
+  if (plan) { $('#filt').hidden = true; return showPlan(); }
+  if (planHost) { destroyPlan(); $('#fp').innerHTML = ''; }
   const el = $('#lst'), now = Date.now(), fq = fold(q), filtering = !!(filterKey || fq);
   const infos = items.map((i) => infoOf(i, now));
-  idMap = new Map(items.map((i) => [i.id, i]));
   let nLow = 0, nNear = 0;
   for (const x of infos) { if (x.low) nLow++; if (x.near) nNear++; }
   const list = infos.filter((x) => (!filterKey || (filterKey === 'low' ? x.low : x.near)) && (!fq || fold(x.i.name).includes(fq)));
@@ -400,6 +444,53 @@ function renderList() {
     t?.focus({ preventScroll: true });
   }
 }
+
+// ---------- 間取り(部屋と収納場所を四角で置く画面。js/floorplan-ui.js を使うときだけ読む) ----------
+let fpP = null, planCtl = null, planHost = null;
+const planRows = (list) => { const now = Date.now(); return list.map((i) => infoOf(i, now)).sort(SORT_CMP(now).std).map((x) => rowHtml(x, 'loc')).join(''); };
+const addAt = (name) => setCtx({ location: name, category: '', sub: '', sticky: true }); // その場所を追加先(固定)にする
+const planEnv = {
+  sync: () => sync, items: () => items, ctx: () => addCtx,
+  status: () => ({ ready: layoutReady, pending: pendL, error: layoutErr }),
+  toast, save: (rec) => save(rec), rows: planRows, rowClick: rowAction, edit: (it) => editDialog(it),
+  add: (name) => { addAt(name); editDialog(); }, scan: (name) => { addAt(name); barcodeAdd(); },
+};
+function destroyPlan() { planCtl?.destroy(); planCtl = null; planHost = null; }
+function showPlan() {
+  const host = $('#fp');
+  if (planHost && planHost !== host) destroyPlan(); // 画面が作り直された
+  if (planCtl) return planCtl.update();
+  if (planHost === host) return; // 読み込み中
+  planHost = host; host.innerHTML = '<p class="sub" role="status">間取りを読み込んでいます…</p>';
+  (fpP ||= import('./floorplan-ui.js')).then((m) => { if (planHost === host && host.isConnected) planCtl = m.mountPlan(host, planEnv); },
+    () => { fpP = null; if (planHost === host) { planHost = null; host.innerHTML = '<div class="empty">間取りの画面を読み込めませんでした。通信を確認して、もう一度お試しください。</div>'; } });
+}
+const setPend = () => { syncMsg = pendI || pendL ? ' ・ 同期中…' : ''; };
+// 間取りの受信(家の `layout` が変わった/お試しモードで保存した)。sync.layout が補正済みの画面用の間取り
+function gotLayout(remote, m) {
+  sync.receive(remote); layoutReady = true; layoutErr = false; pendL = !!m?.pending; setPend();
+  const key = JSON.stringify(sync.layout) + pendL;
+  if (key === lastLKey) return $('#who').textContent = whoText();
+  lastLKey = key; lv++;
+  if (tab === 'stock' && state.household) render(); else $('#who').textContent = whoText();
+}
+function startLayout(hid) {
+  stopLayout(); layoutHid = hid; if (!hid) return;
+  sync = createSync((patch) => store.saveLayoutPatch(patch));
+  layoutUnsub = store.subscribeLayout(gotLayout, (e) => { layoutErr = true; syncMsg = ' ・ ⚠同期エラー'; toast(`間取りを同期できません: ${e.code || e.message}`); render(); });
+}
+function stopLayout() {
+  layoutUnsub?.(); layoutUnsub = null; layoutHid = null; destroyPlan();
+  sync = createSync(async () => {}); layoutReady = layoutErr = pendL = false; lastLKey = ''; lv++;
+}
+// お試しモード: 別のタブで間取りを変えたら取り込む(テストでは localStorage['hs-test']==='1' のときだけ、画面を再読み込みせずに呼べる)
+function reloadLocalLayout() {
+  if (store?.mode !== 'local') return;
+  let raw = null; try { raw = JSON.parse(localStorage.getItem('hs-layout')); } catch {}
+  gotLayout(parseLayout(raw), { pending: false });
+}
+addEventListener('storage', (e) => { if (e.key === 'hs-layout') reloadLocalLayout(); });
+try { if (localStorage.getItem('hs-test') === '1') window.__hsLayoutReload = reloadLocalLayout; } catch {}
 
 // 買い物: 「買った」を押した品はその場に残して(取り消し線)、押し間違いはすぐ戻せる。タブを離れると消える
 const shopDone = new Map(); // id -> {old, sec, idx}
@@ -792,7 +883,7 @@ function rowEff(c) {
   const location = c.ul ? c.location || '' : loc0 || r.location, locSrc = c.ul ? 'hand' : loc0 ? 'ctx' : location ? 'auto' : '';
   return { category: cat, sub, location, catSrc, subSrc, locSrc, auto: !!((catSrc === 'auto' && cat) || (locSrc === 'auto' && location)) };
 }
-const rcText = (e) => `<span>場所・小分類:</span> <b>${e.location ? `${locInfo(e.location).icon} ${esc(e.location)}` : '置き場所なし'}</b>${e.locSrc === 'ctx' ? '(追加先)' : e.locSrc === 'auto' ? '(自動)' : ''} ・ <b>${e.sub ? esc(e.sub) : '小分類なし'}</b>`;
+const rcText = (e) => `<span>場所・小分類:</span> <b>${e.location ? `${locInfoP(e.location).icon} ${esc(e.location)}` : '置き場所なし'}</b>${e.locSrc === 'ctx' ? '(追加先)' : e.locSrc === 'auto' ? '(自動)' : ''} ・ <b>${e.sub ? esc(e.sub) : '小分類なし'}</b>`;
 
 // 取り込み確認の行の期限(c.expiry/expiryKind/expirySrc/expiryFrom。c.ue=手で触った)。折りたたみの中に置く
 const expSum = (c) => ` ・ <b>${c.expiry ? `期限 ${c.expirySrc === '予測' ? `${tagOf('予測', c.expiryLevel)} ` : ''}${dateJa(c.expiry)}` : '期限なし'}</b>`;
@@ -837,7 +928,7 @@ function reviewDialog() {
     return `<div class="card rv" data-row="${n}"><div class="fl" data-fl="${n}"></div><div class="row"><input type="checkbox" data-on="${n}" ${c.on ? 'checked' : ''} aria-label="登録する"><input class="grow" data-nm="${n}" list="rv-names" autocomplete="off" autocorrect="off" enterkeyhint="next" value="${esc(c.name)}" aria-label="品名"><button class="b d" data-rm="${n}" aria-label="この行を削除">✕</button></div>
     <div class="rv2"><div><label>カテゴリ</label><select data-ct="${n}">${selOpts(withCur(categoryOptions(items), e.category), e.category)}</select></div>
     <div><label>数量</label><input data-q="${n}" type="number" inputmode="numeric" min="1" value="${c.qty}"></div><div><label>金額(円)</label><input data-pr="${n}" type="number" inputmode="numeric" enterkeyhint="next" min="0" value="${c.price || ''}"></div></div>
-    <details class="rvc" data-rc="${n}" ${rvOpen.has(c) ? 'open' : ''}><summary data-rcs="${n}">${rcText(e)}${expSum(c)}</summary><div class="grid2"><div><label>小分類</label><select data-sb="${n}">${selOpts(withCur(subOptions(e.category, items), e.sub), e.sub)}</select></div><div><label>置き場所</label><select data-lc="${n}">${selOpts(withCur(lo, e.location), e.location)}</select></div><div><label>期限</label><input type="date" data-ex="${n}" value="${esc(c.expiry || '')}"></div></div><div class="sub exs" data-es="${n}"></div></details>
+    <details class="rvc" data-rc="${n}" ${rvOpen.has(c) ? 'open' : ''}><summary data-rcs="${n}">${rcText(e)}${expSum(c)}</summary><div class="grid2"><div><label>小分類</label><select data-sb="${n}">${selOpts(withCur(subOptions(e.category, items), e.sub), e.sub)}</select></div><div><label>置き場所</label><select data-lc="${n}">${locHtml(withCur(lo, e.location), e.location, true)}</select></div><div><label>期限</label><input type="date" data-ex="${n}" value="${esc(c.expiry || '')}"></div></div><div class="sub exs" data-es="${n}"></div></details>
     <div class="sub">${c.fix ? `<span class="fixd" data-fx="${n}">前回の修正を適用</span> ・ ` : ''}<span data-bg="${n}">${e.catSrc === 'auto' && e.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : e.catSrc === 'ctx' ? '<span class="auto">追加先</span> ' : ''}</span>${c.dup ? '取り込み済み ・ ' : ''}${SRC[c.source] || ''} ${esc(c.boughtAt || '')}${c.discount ? ` ・ 値引 −¥${c.discount} 反映済み` : ''}${c.gap ? ' ・ 検算用(在庫には登録しません)' : ''}</div></div>`;
   };
   const smTxt = (r) => `店名・日付: ${r.store || '(なし)'} ・ ${r.date ? dateJa(r.date) : '(日付なし)'}(タップで直す)`;
@@ -908,8 +999,8 @@ function reviewDialog() {
   // 行の場所・分類の表示を、いまの値(手で選んだ値 > 追加先 > 自動)に合わせ直す
   const syncRow = (n) => {
     const c = draft[n], card = d.querySelector(`[data-row="${n}"]`); if (!card) return;
-    const e = rowEff(c), set = (sel, arr, v) => { sel.innerHTML = selOpts(withCur(arr, v), v); };
-    set(card.querySelector('[data-ct]'), categoryOptions(items), e.category); set(card.querySelector('[data-sb]'), subOptions(e.category, items), e.sub); set(card.querySelector('[data-lc]'), locationOptions(items), e.location);
+    const e = rowEff(c), set = (sel, arr, v, mk = selOpts) => { sel.innerHTML = mk(withCur(arr, v), v, true); };
+    set(card.querySelector('[data-ct]'), categoryOptions(items), e.category); set(card.querySelector('[data-sb]'), subOptions(e.category, items), e.sub); set(card.querySelector('[data-lc]'), locationOptions(items), e.location, locHtml);
     card.querySelector('[data-rcs]').innerHTML = rcText(e) + expSum(c);
     card.querySelector('[data-bg]').innerHTML = e.catSrc === 'auto' && e.category ? '<span class="auto" title="自動で分類しました。違えば選び直せます">自動</span> ' : e.catSrc === 'ctx' ? '<span class="auto">追加先</span> ' : '';
   };
@@ -1654,8 +1745,9 @@ renderBars(); // 固定していた追加先があれば、ナビの＋の読み
   store = await createStore();
   await store.init((s) => {
     state = s; unsub?.(); unsub = null;
+    const hid = s.household?.id ?? null; if (hid !== layoutHid) startLayout(hid);
     if (s.household) unsub = store.subscribe((a, m) => {
-      syncMsg = m?.pending ? ' ・ 同期中…' : '';
+      pendI = !!m?.pending; setPend();
       const sig = JSON.stringify(a);
       if (sig !== lastSig) { lastSig = sig; items = a; render(); } else $('#who').textContent = whoText();
     }, (e) => { syncMsg = ' ・ ⚠同期エラー'; toast(`同期できません: ${e.code || e.message}`); render(); });
